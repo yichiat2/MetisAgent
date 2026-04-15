@@ -48,8 +48,8 @@ class InhomoHestonProcess(StochasticProcessBase):
         "rho":       ("tanh",      -0.99,  0.99),
         "kappa":     ("sigmoid_ab", 0.1,  10.0),
         "theta":     ("sigmoid_ab", 0.01,  1.0),
-        "sigma":     ("sigmoid_ab", 0.01,  1.0),
-        "r":         ("sigmoid_ab", -0.05, 0.05),
+        "sigma":     ("sigmoid_ab", 0.1,  1.0),
+        "r":         ("sigmoid_ab", -0.00001, 0.00001),
         "lambda_ov": ("sigmoid_ab", 0.01,  0.5),
     }
 
@@ -61,8 +61,9 @@ class InhomoHestonProcess(StochasticProcessBase):
         dt: float,
         num_particles: int,
         S: np.ndarray,
+        rho_cpm: float = 0.0,
     ):
-        super().__init__(popsize, num_generations, sigma_init, dt, num_particles, S)
+        super().__init__(popsize, num_generations, sigma_init, dt, num_particles, S, rho_cpm)
 
     # ------------------------------------------------------------------
     # APF log-likelihood
@@ -268,6 +269,7 @@ class InhomoHestonProcess(StochasticProcessBase):
             sigma_init=self.sigma_init,
             dt=self.dt,
             num_particles=self.num_particles,
+            rho_cpm=self.rho_cpm,
         )
         return setting, dsetting
 

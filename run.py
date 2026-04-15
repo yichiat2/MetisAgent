@@ -7,9 +7,6 @@ import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-
-from heston_process import HestonProcess
-from heston_jump import HestonJumpProcess
 from inhomo_heston_process import InhomoHestonProcess
 from qrh_process import QRHProcess
 from constants import _MINS_PER_DAY, _DT_MIN, _DT_OVERNIGHT
@@ -303,13 +300,13 @@ def _to_qrh_param_dict(values: np.ndarray) -> dict[str, float]:
 
 
 def run_inhomo_heston(
-    seed: int = 7,
+    seed: int = 9,
     S0: float = 100.0,
-    num_days: int = 20,
+    num_days: int = 40,
     true_params: np.ndarray | None = None,
-    popsize: int = 512,
+    popsize: int = 256,
     num_generations: int = 100,
-    sigma_init: float = 0.3,
+    sigma_init: float = 0.8,
     num_particles: int = 2048,
     plot_path: str | Path | None = None,
 ) -> dict[str, object]:
@@ -370,6 +367,7 @@ def run_inhomo_heston(
         dt=float(_DT_MIN),
         num_particles=num_particles,
         S=prices,
+        rho_cpm=0.99,
     )
     setting, dsetting = process.get_default_param(jax.random.PRNGKey(seed))
 
@@ -387,7 +385,7 @@ def run_inhomo_heston(
     )
 
     # Second filter pass using true parameters
-    _, true_filter_info = process.loglikelihood(
+    true_filter_carry, true_filter_info = process.loglikelihood(
         jnp.asarray(true_params, dtype=jnp.float32)[None, :],
         setting,
         dsetting,
@@ -395,6 +393,12 @@ def run_inhomo_heston(
     true_param_filtered_variance = np.asarray(
         jax.device_get(true_filter_info.filtered_mean), dtype=np.float32
     )
+
+    true_param_filtered_variance = np.asarray(
+        jax.device_get(true_filter_info.filtered_mean), dtype=np.float32
+    )
+    true_param_loglik = float(jax.device_get(true_filter_carry[-1][0]))
+
 
     filtered_variance  = np.asarray(jax.device_get(filter_info.filtered_mean),     dtype=np.float32)
     filtered_std       = np.asarray(jax.device_get(filter_info.filtered_std),      dtype=np.float32)
@@ -418,6 +422,7 @@ def run_inhomo_heston(
         "variance_rmse":     float(np.sqrt(np.mean((filtered_variance - true_variance) ** 2))),
         "mean_ess":          float(np.mean(ess)),
         "true_param_filtered_variance": true_param_filtered_variance,
+        "true_param_loglik":            true_param_loglik,
         "true_param_variance_rmse": float(
             np.sqrt(np.mean((true_param_filtered_variance - true_variance) ** 2))
         ),
@@ -593,6 +598,7 @@ def main() -> None:
     summary_ih = {
         "true_params":              result_ih["true_params"],
         "fitted_params":            result_ih["fitted_params"],
+        "true_param_loglik":        result_ih["true_param_loglik"],
         "best_loglik":              result_ih["best_loglik"],
         "bic":                      result_ih["bic"],
         "variance_rmse":            result_ih["variance_rmse"],
@@ -614,6 +620,7 @@ def main() -> None:
     #     "mean_ess":                 result_qrh["mean_ess"],
     # }
     # print(json.dumps(summary_qrh, indent=2, sort_keys=True))
+
 
 
 if __name__ == "__main__":

@@ -1,11 +1,14 @@
-from abc import abstractmethod
+from __future__ import annotations
 
-from evosax.algorithms import CMA_ES
+from abc import abstractmethod
+from typing import NamedTuple
+from evosax.algorithms import SNES as ES
 import jax
 import jax.numpy as jnp
 from flax.struct import dataclass
 import chex
 import numpy as np
+import optax
 
 @dataclass
 class Setting:
@@ -15,6 +18,7 @@ class Setting:
     sigma_init: float
     dt: float
     num_particles: int
+    rho_cpm: float
 
 @dataclass
 class DynSetting:
@@ -62,12 +66,14 @@ class StochasticProcessBase:
                  sigma_init: float,
                  dt: float,
                  num_particles: int,
-                 S: np.ndarray):
+                 S: np.ndarray,
+                 rho_cpm: float):
         self.popsize = popsize
         self.num_generations = num_generations
         self.sigma_init = sigma_init
         self.dt = dt
         self.num_particles = num_particles
+        self.rho_cpm = rho_cpm
         self.S = jnp.array(S, dtype=jnp.float32)
 
     def params_to_unconstrained(self, params: dict) -> jnp.ndarray:
@@ -127,19 +133,35 @@ class StochasticProcessBase:
 
     def calibrate(self, key, setting: Setting, dsetting: DynSetting):
         init_mean = jnp.asarray(dsetting.initial_guess, dtype=jnp.float32)
-        strategy = CMA_ES(population_size=setting.popsize, solution=init_mean)
-        strategy.elite_ratio = 0.5
+        optimizer = optax.adam(learning_rate=0.01)
+        strategy = ES(population_size=setting.popsize, solution=init_mean, optimizer=optimizer)
         strategy_params = strategy.default_params.replace(std_init=jnp.float32(setting.sigma_init))
 
         key, init_key, scan_key = jax.random.split(key, 3)
         state = strategy.init(init_key, init_mean, strategy_params)
 
-        def _run_generation(state, rng_step):
-            ask_key, tell_key = jax.random.split(rng_step, 2)
+        _rho      = jnp.float32(setting.rho_cpm)
+        _sqrt1mr2 = jnp.float32(np.sqrt(1.0 - setting.rho_cpm ** 2))
+
+        def _run_generation(carry, rng_step):
+            state, noises = carry
+            ask_key, tell_key, noise_key = jax.random.split(rng_step, 3)
+
+            # CPM AR(1) noise update
+            xi        = jax.random.normal(noise_key, noises.shape)
+            noises    = _rho * noises + _sqrt1mr2 * xi
+
+            ds = DynSetting(
+                S=dsetting.S,
+                initial_guess=dsetting.initial_guess,
+                dt_seq=dsetting.dt_seq,
+                noises=noises,
+            )
+
             candidates, state = strategy.ask(ask_key, state, strategy_params)
             constrained_candidates = jax.vmap(self.unconstrained_to_params)(candidates)
 
-            fitness = self.fitness_function(constrained_candidates, setting, dsetting)
+            fitness = self.fitness_function(constrained_candidates, setting, ds)
             fitness = jnp.where(jnp.isfinite(fitness), fitness, jnp.float32(1e12))
             state, _ = strategy.tell(tell_key, candidates, fitness, state, strategy_params)
 
@@ -149,16 +171,16 @@ class StochasticProcessBase:
                             z=state.best_fitness, a=bic)
 
             best_param = self.unconstrained_to_params(state.best_solution)
-            jax.debug.print("Parameter: {x}, Sigma: {y:.2f}", x=best_param, y=state.std)
-            return state, None
+            jax.debug.print("Parameter: {x}, Sigma: {y}", x=best_param, y=state.std)
+            return (state, noises), None
 
         rng_steps = jax.random.split(scan_key, setting.num_generations)
 
         @jax.jit
-        def _run_scan(state_init, rng_keys):
-            return jax.lax.scan(_run_generation, state_init, rng_keys)
+        def _run_scan(state_init, noises_init, rng_keys):
+            return jax.lax.scan(_run_generation, (state_init, noises_init), rng_keys)
 
-        state, _ = _run_scan(state, rng_steps)
+        (state, _), _ = _run_scan(state, dsetting.noises, rng_steps)
         final_state = state
         bic = 2 * final_state.best_fitness + setting.num_dims * jnp.log(jnp.maximum(dsetting.S.shape[0] - 1, 1))
         return final_state.best_solution, bic
