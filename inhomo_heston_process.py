@@ -14,6 +14,7 @@ Parameters (7-dim vector):
     x[4]  sigma     – vol of vol
     x[5]  r         – risk-free drift
     x[6]  lambda_ov – overnight sub-step intensity   (0.01 < lambda < 0.5)
+    x[7]  alpha_rs  – Rogers-Satchell shape parameter (0.5 < alpha < 20.0)
 
 Data layout:
     Each trading day produces (390 + 1) steps.  Steps 0-389 within each day
@@ -29,12 +30,13 @@ import chex
 import numpy as np
 
 from constants import _MINS_PER_DAY, _DT_MIN, _DT_OVERNIGHT, _OVERNIGHT_MINS
-from stochastic import StochasticProcessBase, Setting, DynSetting
+from stochastic import StochasticProcessBase, Setting, DynSetting, make_dt_seq
 from helper import (
     VARIANCE_FLOOR,
     FilterInfo,
     _positive_variance,
     _gaussian_logpdf,
+    _gamma_logpdf,
     _systematic_resample,
     _effective_sample_size,
 )
@@ -42,15 +44,16 @@ from helper import (
 class InhomoHestonProcess(StochasticProcessBase):
     """Heston model with sub-stepped overnight variance propagation."""
 
-    PARAM_NAMES = ["v0", "rho", "kappa", "theta", "sigma", "r", "lambda_ov"]
+    PARAM_NAMES = ["v0", "rho", "kappa", "theta", "sigma", "r", "lambda_ov", "alpha_rs"]
     PARAM_TRANSFORMS = {
         "v0":        ("sigmoid_ab", 0.01,  0.1),
         "rho":       ("tanh",      -0.99,  0.99),
         "kappa":     ("sigmoid_ab", 0.1,  10.0),
         "theta":     ("sigmoid_ab", 0.01,  1.0),
-        "sigma":     ("sigmoid_ab", 0.1,  1.0),
+        "sigma":     ("sigmoid_ab", 0.1,  10.0),
         "r":         ("sigmoid_ab", -0.00001, 0.00001),
         "lambda_ov": ("sigmoid_ab", 0.01,  0.5),
+        "alpha_rs":  ("sigmoid_ab", 0.5,  20.0),
     }
 
     def __init__(
@@ -62,8 +65,18 @@ class InhomoHestonProcess(StochasticProcessBase):
         num_particles: int,
         S: np.ndarray,
         rho_cpm: float = 0.0,
+        rs_data: np.ndarray | None = None,
     ):
         super().__init__(popsize, num_generations, sigma_init, dt, num_particles, S, rho_cpm)
+        # rs_data: shape (T,) Rogers-Satchell variance observations aligned with S[1:].
+        # None is replaced by a zeros placeholder so the likelihood is dominated by
+        # the log-return observation (Gamma scale becomes degenerate; the term still
+        # evaluates but has near-zero contribution relative to the return term).
+        T = S.shape[0] - 1
+        if rs_data is not None:
+            self._rs_data = jnp.array(rs_data, dtype=jnp.float32)
+        else:
+            self._rs_data = jnp.full((T,), fill_value=1e-6, dtype=jnp.float32)
 
     # ------------------------------------------------------------------
     # APF log-likelihood
@@ -82,6 +95,7 @@ class InhomoHestonProcess(StochasticProcessBase):
         sigma     = x[:, 4]
         r_val     = x[:, 5]
         lambda_ov = x[:, 6]
+        alpha_rs  = x[:, 7]
 
         # Flatten per-candidate params to (P*N,) for per-particle vmap.
         kappa_pn = jnp.repeat(kappa, N)
@@ -89,14 +103,17 @@ class InhomoHestonProcess(StochasticProcessBase):
         sigma_pn = jnp.repeat(sigma, N)
         rho_pn   = jnp.repeat(rho,   N)
         r_pn     = jnp.repeat(r_val, N)
+        alpha_rs_pn = jnp.repeat(alpha_rs, N)    # (P*N,)
 
         log_prices  = jnp.log(dsetting.S)
         log_returns = log_prices[1:] - log_prices[:-1]  # (T,)
         dt_seq      = dsetting.dt_seq                    # (T,)
         noises_seq  = dsetting.noises                    # (T, N+2)  CRN
+        rs_seq      = dsetting.rs_seq                    # (T,)
 
-        base_dt = jnp.float32(_DT_MIN)
-        ov_mins = jnp.float32(_OVERNIGHT_MINS)
+        base_dt  = jnp.float32(_DT_MIN)
+        ov_mins  = jnp.float32(_OVERNIGHT_MINS)
+        
 
         # Initial state: particles (P*N,), total_loglik (P,).
         # log_weights is omitted from carry: after every step they are reset to
@@ -106,7 +123,7 @@ class InhomoHestonProcess(StochasticProcessBase):
         log_N        = jnp.log(jnp.float32(N))
 
         def _apf_step(carry, xs):
-            obs, dt_i, noises_t = xs
+            obs, dt_i, noises_t, rs_obs = xs
             particles_pn, total_loglik = carry
 
             eps_v_t = noises_t[:N]       # (N,)  CRN
@@ -120,12 +137,15 @@ class InhomoHestonProcess(StochasticProcessBase):
             dt_eff_p     = jnp.where(is_overnight, n_sub_p * base_dt, dt_i)                # (P,)
             dt_eff_pn    = jnp.repeat(dt_eff_p, N)                                         # (P*N,)
 
-            # ── Pilot: vmap over P*N ─────────────────────────────────────
-            def _pilot_one(v, k, th, r, dt_e):
-                vp = _positive_variance(v + k * (th - v) * dt_e)
-                return _gaussian_logpdf(obs, (r - jnp.float32(0.5) * vp) * dt_e, vp * dt_e)
+            # ── Pilot: Gaussian (return) + Gamma (RS) ────────────────────
+            def _pilot_one(v, k, th, r, dt_e, a_rs):
+                vp         = _positive_variance(v + k * (th - v) * dt_e)
+                log_g_ret  = _gaussian_logpdf(obs, (r - jnp.float32(0.5) * vp) * dt_e, vp * dt_e)
+                rs_scale   = _positive_variance(vp * dt_e / a_rs)
+                log_g_rs   = _gamma_logpdf(rs_obs, a_rs, rs_scale)
+                return log_g_ret + log_g_rs
 
-            log_g_pn = jax.vmap(_pilot_one)(particles_pn, kappa_pn, theta_pn, r_pn, dt_eff_pn)
+            log_g_pn = jax.vmap(_pilot_one)(particles_pn, kappa_pn, theta_pn, r_pn, dt_eff_pn, alpha_rs_pn)
             log_g    = log_g_pn.reshape(P, N)
 
             # ── First-stage: vmap over P ──────────────────────────────────
@@ -148,13 +168,16 @@ class InhomoHestonProcess(StochasticProcessBase):
             )                                                                                   # (P*N,)
             v_next = v_next_pn.reshape(P, N)                                                   # (P, N)
 
-            # ── Conditional likelihood: vmap over P*N ────────────────────
-            def _log_p_one(v_n, r, rh, e, dt_e):
+            # ── Conditional likelihood: Gaussian (return) + Gamma (RS) ───
+            def _log_p_one(v_n, r, rh, e, dt_e, a_rs):
                 mu_c   = (r - jnp.float32(0.5) * v_n) * dt_e + jnp.sqrt(_positive_variance(v_n * dt_e)) * rh * e
                 sig2_c = _positive_variance(v_n * (jnp.float32(1.0) - rh ** 2) * dt_e)
-                return _gaussian_logpdf(obs, mu_c, sig2_c)
+                log_p_ret = _gaussian_logpdf(obs, mu_c, sig2_c)
+                rs_scale  = _positive_variance(v_n * dt_e / a_rs)
+                log_p_rs  = _gamma_logpdf(rs_obs, a_rs, rs_scale)
+                return log_p_ret + log_p_rs
 
-            log_p_pn = jax.vmap(_log_p_one)(v_next_pn, r_pn, rho_pn, eps_pn, dt_eff_pn)      # (P*N,)
+            log_p_pn = jax.vmap(_log_p_one)(v_next_pn, r_pn, rho_pn, eps_pn, dt_eff_pn, alpha_rs_pn)  # (P*N,)
             log_p    = log_p_pn.reshape(P, N)                                                  # (P, N)
 
             log_alpha = log_p - log_g_sel                                                      # (P, N)
@@ -198,7 +221,7 @@ class InhomoHestonProcess(StochasticProcessBase):
 
         init_carry = (particles, total_loglik)
         final_carry, (filt_means, filt_stds, ess_seq, loglik_incs, pred_means, pred_stds) = \
-            jax.lax.scan(_apf_step, init_carry, (log_returns, dt_seq, noises_seq))
+            jax.lax.scan(_apf_step, init_carry, (log_returns, dt_seq, noises_seq, rs_seq))
 
         return final_carry, FilterInfo(
             filtered_mean=filt_means,
@@ -246,13 +269,14 @@ class InhomoHestonProcess(StochasticProcessBase):
             'sigma':     0.2,
             'r':         0.0,
             'lambda_ov': 0.1,
+            'alpha_rs':  2.0,
         }
 
         num_dims      = len(initial_guess)
         initial_guess_unconstrained = self.params_to_unconstrained(initial_guess)
 
         dt_seq = jnp.array(
-            InhomoHestonProcess.make_dt_seq(self.S.shape[0] - 1), dtype=jnp.float32
+            make_dt_seq((self.S.shape[0] - 1) // _MINS_PER_DAY), dtype=jnp.float32
         )
         noises = self.get_noises(key)
 
@@ -261,6 +285,7 @@ class InhomoHestonProcess(StochasticProcessBase):
             initial_guess=initial_guess_unconstrained,
             dt_seq=dt_seq,
             noises=noises,
+            rs_seq=self._rs_data,
         )
         setting = Setting(
             popsize=self.popsize,
@@ -274,25 +299,6 @@ class InhomoHestonProcess(StochasticProcessBase):
         return setting, dsetting
 
     # ------------------------------------------------------------------
-    # dt_seq helper
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def make_dt_seq(num_steps: int) -> np.ndarray:
-        """Build a dt_seq for *num_steps* steps.
-
-        Expects num_steps = (390 + 1) * num_days.  Within each block of 391
-        steps, indices 0-389 get dt = _DT_MIN and index 390 gets dt = _DT_OVERNIGHT.
-        """
-        dt_seq = np.empty(num_steps, dtype=np.float32)
-        for i in range(num_steps):
-            if (i + 1) % (_MINS_PER_DAY + 1) == 0:
-                dt_seq[i] = _DT_OVERNIGHT
-            else:
-                dt_seq[i] = _DT_MIN
-        return dt_seq
-
-    # ------------------------------------------------------------------
     # Synthetic data generator
     # ------------------------------------------------------------------
 
@@ -303,11 +309,26 @@ class InhomoHestonProcess(StochasticProcessBase):
         num_days: int,
         params: np.ndarray,
     ):
-        """Generate synthetic log-returns and variance paths.
+        """Generate synthetic OHLC prices, log-returns, variance paths, and
+        Rogers-Satchell intrabar variance estimates.
 
         Data layout: (390 + 1) * num_days steps.
         Each day has 390 intraday steps at dt = 1 minute followed by
         1 overnight step at dt = 1050 minutes.
+
+        Intrabar O, H, L are simulated via an exact Brownian-bridge
+        maximum/minimum distribution (Revuz & Yor reflection principle),
+        conditioning on the realised close log-return and constant intrabar
+        variance v_next.  Open = previous close, Close = Open * exp(log_return).
+        High = Open * exp(h),  Low = Open * exp(l) where:
+            h = (c + sqrt(c² − 2·v·dt·ln U_H)) / 2,  U_H ~ Uniform(0,1)
+            l = (c − sqrt(c² − 2·v·dt·ln U_L)) / 2,  U_L ~ Uniform(0,1)
+        with c = log_return, v = v_next, dt as the bar width.
+
+        The Rogers-Satchell estimator for each bar is:
+            RS = (h−c)·h + (l−c)·l
+        where h = ln(H/O), l = ln(L/O), c = ln(C/O).
+        RS is an unbiased estimator of v·dt.
 
         Args:
             seed:     RNG seed.
@@ -317,8 +338,8 @@ class InhomoHestonProcess(StochasticProcessBase):
                       [v0, rho, kappa, theta, sigma, r, lambda_ov].
 
         Returns:
-            (log_returns, variances) each of shape
-            ``((390 + 1) * num_days,)`` and dtype float32.
+            Tuple (log_returns, variances, opens, highs, lows, rs_variances)
+            each of shape ``((390 + 1) * num_days,)`` and dtype float32.
         """
         if num_days < 1:
             raise ValueError("num_days must be >= 1")
@@ -326,47 +347,87 @@ class InhomoHestonProcess(StochasticProcessBase):
             raise ValueError("S0 must be positive")
 
         params = np.asarray(params, dtype=np.float64)
-        if params.shape != (7,):
+        if params.shape != (8,):
             raise ValueError(
-                "params must have shape (7,) ordered as "
-                "[v0, rho, kappa, theta, sigma, r, lambda_ov]"
+                "params must have shape (8,) ordered as "
+                "[v0, rho, kappa, theta, sigma, r, lambda_ov, rs_alpha]"
             )
 
-        v0, rho, kappa, theta, sigma, r, lambda_ov = params
+        v0, rho, kappa, theta, sigma, r, lambda_ov, rs_alpha = params
         sqrt_one_minus_rho_sq = np.sqrt(max(1.0 - rho ** 2, 1e-8))
         rng = np.random.default_rng(seed)
 
         length          = (_MINS_PER_DAY + 1) * num_days
         variances       = np.zeros(length, dtype=np.float64)
         log_returns     = np.zeros(length, dtype=np.float64)
+        opens           = np.zeros(length, dtype=np.float64)
+        highs           = np.zeros(length, dtype=np.float64)
+        lows            = np.zeros(length, dtype=np.float64)
+        rs_variances    = np.zeros(length, dtype=np.float64)
         variance_prev   = max(v0, VARIANCE_FLOOR)
+        price_prev      = float(S0)
 
-        n_sub = max(1.0, round(_OVERNIGHT_MINS * lambda_ov))
-        base_dt       = float(_DT_MIN) 
+        n_sub   = max(1.0, round(_OVERNIGHT_MINS * lambda_ov))
+        base_dt = float(_DT_MIN)
 
         for step in range(length):
-            in_block = step % (_MINS_PER_DAY + 1)
+            in_block     = step % (_MINS_PER_DAY + 1)
             is_overnight = (in_block == _MINS_PER_DAY)
 
-            dt = n_sub * base_dt if is_overnight else base_dt        
-            
-            eps_v = rng.normal()
-            v_next  = max(
-                    variance_prev
-                    + kappa * (theta - variance_prev) * dt
-                    + sigma * np.sqrt(variance_prev) * np.sqrt(dt) * eps_v,
-                    VARIANCE_FLOOR,
-                )
+            dt = n_sub * base_dt if is_overnight else base_dt
 
-            eps_orthogonal  = rng.normal()
+            # ── Variance propagation ─────────────────────────────────────────
+            eps_v  = rng.normal()
+            v_next = max(
+                variance_prev
+                + kappa * (theta - variance_prev) * dt
+                + sigma * np.sqrt(variance_prev) * np.sqrt(dt) * eps_v,
+                VARIANCE_FLOOR,
+            )
+
+            # ── Correlated price shock ───────────────────────────────────────
+            eps_orthogonal   = rng.normal()
             correlated_shock = rho * eps_v + sqrt_one_minus_rho_sq * eps_orthogonal
             log_return = (
                 (r - 0.5 * v_next) * dt
                 + np.sqrt(v_next * dt) * correlated_shock
             )
 
-            variances[step]   = v_next
-            log_returns[step] = log_return
-            variance_prev     = v_next
+            # ── Brownian-bridge OHLC ─────────────────────────────────────────
+            # c = log(C/O) = log_return; bridge from 0 → c with variance v_next*dt
+            c        = log_return
+            var_dt   = max(v_next * dt, 1e-30)
+            u_h      = rng.uniform()
+            u_l      = rng.uniform()
 
-        return log_returns.astype(np.float32), variances.astype(np.float32)
+            disc_h   = c * c - 2.0 * var_dt * np.log(u_h)
+            disc_l   = c * c - 2.0 * var_dt * np.log(u_l)
+            h        = (c + np.sqrt(max(disc_h, 0.0))) / 2.0   # log(H/O)
+            l        = (c - np.sqrt(max(disc_l, 0.0))) / 2.0   # log(L/O)
+
+            # Clamp to valid range (numerical safety)
+            h = max(h, max(0.0, c))
+            l = min(l, min(0.0, c))
+
+            # ── Rogers-Satchell estimator: E[RS] = v_next * dt ──────────────
+            rs = (h - c) * h + (l - c) * l
+
+            # ── Record ───────────────────────────────────────────────────────
+            variances[step]    = v_next
+            log_returns[step]  = log_return
+            opens[step]        = price_prev
+            highs[step]        = price_prev * np.exp(h)
+            lows[step]         = price_prev * np.exp(l)
+            rs_variances[step] = max(rs, 1e-30)
+
+            price_prev    = price_prev * np.exp(log_return)
+            variance_prev = v_next
+
+        return (
+            log_returns.astype(np.float32),
+            variances.astype(np.float32),
+            opens.astype(np.float32),
+            highs.astype(np.float32),
+            lows.astype(np.float32),
+            rs_variances.astype(np.float32),
+        )

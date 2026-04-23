@@ -64,7 +64,7 @@ import numpy as np
 from scipy.stats import norm
 
 from constants import _MINS_PER_DAY, _DT_MIN, _OVERNIGHT_MINS
-from stochastic import StochasticProcessBase, Setting, DynSetting
+from stochastic import StochasticProcessBase, Setting, DynSetting, make_dt_seq
 from helper import (
     VARIANCE_FLOOR,
     _positive_variance,
@@ -312,12 +312,7 @@ class SemivarianceHestonProcess(StochasticProcessBase):
             # Down-bar: r | v-_n, eps_vm  ~ N(mu_vm + rho_m*sqrt(v-*dt)*eps_vm,
             #                                  (1-rho_m^2)*v-*dt)
             def _log_p_one(vp_n, vm_n, rp, rm, rho_pm_, e_vp, eta_vm, r, dt_e):
-                eps_vm = (
-                    rho_pm_ * e_vp
-                    + jnp.sqrt(_positive_variance(jnp.float32(1.0) - rho_pm_ ** 2))
-                    * eta_vm
-                )
-           
+                
                 vp_n = _positive_variance(vp_n)
                 vm_n = _positive_variance(vm_n)
                 
@@ -331,9 +326,9 @@ class SemivarianceHestonProcess(StochasticProcessBase):
                 # eps_vm = rho_pm_ * e_vp + sqrt(1 - rho_pm_**2) * eta_vm
                 # eps_S conditionally expects a contribution from both independent noises
                 beta_denom = jnp.sqrt(_positive_variance(jnp.float32(1.0) - rho_pm_ ** 2))
-                beta = (rm - rp * rho_pm_) / _positive_variance(beta_denom)
+                beta = (rm - rp * rho_pm_) / beta_denom
                 eps_S_cond_mean = rp * e_vp + beta * eta_vm
-                cond_var_scale = _positive_variance(jnp.float32(1.0) - rp**2 - beta**2)
+                cond_var_scale = _positive_variance(jnp.float32(1.0) - rp ** 2 - beta ** 2)
                 
                 # Up-bar branch
                 mu_up  = drift + jnp.sqrt(vp_n * dt_e) * eps_S_cond_mean
@@ -350,7 +345,7 @@ class SemivarianceHestonProcess(StochasticProcessBase):
                 rho_p_pn, rho_m_pn, rho_pm_pn,
                 eps_vp_pn, eta_vm_pn,
                 r_pn, dt_eff_pn,
-            )  # (P*N,)
+            )  
             log_p     = log_p_pn.reshape(P, N)
             log_alpha = log_p - log_g_sel        # (P, N)
 
@@ -390,7 +385,6 @@ class SemivarianceHestonProcess(StochasticProcessBase):
                 drift = r * dt_e - mean_noise - jnp.float32(0.5) * var_noise
                 
                 is_up_local = obs >= drift
-                
                 sigma2   = jnp.where(is_up_local, vp_pilot, vm_pilot)
                 return drift, sigma2 * dt_e
 
@@ -488,7 +482,7 @@ class SemivarianceHestonProcess(StochasticProcessBase):
         initial_guess_unc = self.params_to_unconstrained(initial_guess)
 
         dt_seq = jnp.array(
-            InhomoHestonProcess.make_dt_seq(self.S.shape[0] - 1),
+            make_dt_seq((self.S.shape[0] - 1) // _MINS_PER_DAY),
             dtype=jnp.float32,
         )
         noises = self.get_noises(key)
@@ -498,6 +492,7 @@ class SemivarianceHestonProcess(StochasticProcessBase):
             initial_guess=initial_guess_unc,
             dt_seq=dt_seq,
             noises=noises,
+            rs_seq=jnp.empty((0,), dtype=jnp.float32),
         )
         setting = Setting(
             popsize=self.popsize,

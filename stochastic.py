@@ -10,6 +10,20 @@ import chex
 import numpy as np
 import optax
 
+from constants import _MINS_PER_DAY, _DT_MIN, _DT_OVERNIGHT, _DT_OVERWEEKEND
+
+
+def make_dt_seq(num_days: int) -> np.ndarray:
+  
+    num_steps = _MINS_PER_DAY * num_days
+    dt_out    = np.full(num_steps, _DT_MIN, dtype=np.float32)
+    for day in range(1, num_days):
+        index = day * _MINS_PER_DAY
+        if index < num_steps:
+            dt_out[index] = _DT_OVERNIGHT if day % 5 != 0 else _DT_OVERWEEKEND
+    return dt_out
+
+
 @dataclass
 class Setting:
     popsize: int
@@ -26,6 +40,7 @@ class DynSetting:
     initial_guess: chex.Array
     dt_seq: chex.Array
     noises: chex.Array
+    rs_seq: chex.Array  # RS variance observations; shape (T,) or empty (0,) if unused
 
 
 # ── Parameter transform primitives ───────────────────────────────────────
@@ -147,8 +162,9 @@ class StochasticProcessBase:
             state, noises = carry
             ask_key, tell_key, noise_key = jax.random.split(rng_step, 3)
 
-            # CPM AR(1) noise update
-            xi        = jax.random.normal(noise_key, noises.shape)
+            # CPM AR(1) noise update: xi drawn with same structure as noises
+            # so that uniform columns stay statistically compatible with U[0,1).
+            xi        = self.get_noises(noise_key)
             noises    = _rho * noises + _sqrt1mr2 * xi
 
             ds = DynSetting(
@@ -156,6 +172,7 @@ class StochasticProcessBase:
                 initial_guess=dsetting.initial_guess,
                 dt_seq=dsetting.dt_seq,
                 noises=noises,
+                rs_seq=dsetting.rs_seq,
             )
 
             candidates, state = strategy.ask(ask_key, state, strategy_params)

@@ -40,7 +40,7 @@ import jax.scipy.special as jsp
 import chex
 import numpy as np
 
-from stochastic import StochasticProcessBase, Setting, DynSetting
+from stochastic import StochasticProcessBase, Setting, DynSetting, make_dt_seq
 from helper import (
     FilterInfo,
     _gaussian_logpdf,
@@ -467,7 +467,7 @@ class QRHProcess(StochasticProcessBase):
         initial_guess_unconstrained = self.params_to_unconstrained(initial_guess)
 
         dt_seq = jnp.array(
-            QRHProcess.make_dt_seq(self.S.shape[0] - 1), dtype=jnp.float32
+            make_dt_seq((self.S.shape[0] - 1) // _MINS_PER_DAY), dtype=jnp.float32
         )
         noises = self.get_noises(key)
 
@@ -476,6 +476,7 @@ class QRHProcess(StochasticProcessBase):
             initial_guess=initial_guess_unconstrained,
             dt_seq=dt_seq,
             noises=noises,
+            rs_seq=jnp.empty((0,), dtype=jnp.float32),
         )
         setting = Setting(
             popsize=self.popsize,
@@ -486,26 +487,6 @@ class QRHProcess(StochasticProcessBase):
             num_particles=self.num_particles,
         )
         return setting, dsetting
-
-    # ------------------------------------------------------------------
-    # dt_seq helper
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def make_dt_seq(num_steps: int) -> np.ndarray:
-        """Build a dt_seq for *num_steps* steps.
-
-        Expects num_steps = (390 + 1) * num_days.  Within each block of 391
-        steps, indices 0–389 get dt = _DT_MIN and index 390 gets dt =
-        _DT_OVERNIGHT (same convention as InhomoHestonProcess).
-        """
-        dt_seq = np.empty(num_steps, dtype=np.float32)
-        for i in range(num_steps):
-            if (i + 1) % (_MINS_PER_DAY + 1) == 0:
-                dt_seq[i] = _DT_OVERNIGHT
-            else:
-                dt_seq[i] = _DT_MIN
-        return dt_seq
 
     # ------------------------------------------------------------------
     # Synthetic data generator

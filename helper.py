@@ -7,7 +7,7 @@ import numpy as np
 
 
 VARIANCE_FLOOR = 1e-8
-
+EPS = 1e-30
 
 class FilterCarry(NamedTuple):
     particles: chex.Array
@@ -65,6 +65,22 @@ def _systematic_resample(log_weights: chex.Array, u: chex.Array) -> chex.Array:
     ancestors = jnp.repeat(jnp.arange(num_particles), particle_counts, total_repeat_length=num_particles)
     
     return ancestors
+
+
+def _gamma_logpdf(x: chex.Array, alpha: float, scale: chex.Array) -> chex.Array:
+    """Log-pdf of Gamma(shape=alpha, scale=scale).
+
+    Parameterisation: mean = alpha * scale, variance = alpha * scale^2.
+    Both x and scale are floored to VARIANCE_FLOOR for numerical safety.
+    """
+    x     = _positive_variance(x)
+    scale = _positive_variance(scale)
+    return (
+        (alpha - 1.0) * jnp.log(x)
+        - x / scale
+        - alpha * jnp.log(scale)
+        - jax.lax.lgamma(jnp.float32(alpha))
+    )
 
 
 def _effective_sample_size(log_weights: chex.Array) -> chex.Array:

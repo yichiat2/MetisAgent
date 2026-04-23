@@ -7,14 +7,17 @@ import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
+from heston_jump_process import HestonJumpProcess
+from svlogv_jump_process import StochasticVolatilityJumpProcess
 from inhomo_heston_process import InhomoHestonProcess
 from qrh_process import QRHProcess
 from semivariance_heston_process import SemivarianceHestonProcess
+from stochastic import DynSetting
 from constants import _MINS_PER_DAY, _DT_MIN, _DT_OVERNIGHT
 
 
 PARAM_NAMES = ("v0", "rho", "kappa", "theta", "sigma", "r")
-PARAM_NAMES_INHOMO = ("v0", "rho", "kappa", "theta", "sigma", "r", "lambda_ov")
+PARAM_NAMES_INHOMO = ("v0", "rho", "kappa", "theta", "sigma", "r", "lambda_ov", "alpha_rs")
 PARAM_NAMES_QRH = ("a0", "a1", "a2", "rho", "alpha", "sigma_obs", "lambda_ov")
 PARAM_NAMES_SV = (
     "v0p", "v0m",
@@ -28,6 +31,10 @@ PARAM_NAMES_JUMP = (
     "v0", "rho", "kappa", "theta", "sigma", "r",
     "p_J", "mu_Jr", "sigma_Jr", "mu_JV", "sigma_JV", "rho_J",
 )
+PARAM_NAMES_SVJ = (
+    "lnv0", "kappa", "theta", "sigma_v", "rho", "r",
+    "lambda_J", "mu_JS", "sigma_JS", "mu_JV", "sigma_JV", "rho_J",
+)
 
 
 def _to_param_dict(values: np.ndarray) -> dict[str, float]:
@@ -36,6 +43,10 @@ def _to_param_dict(values: np.ndarray) -> dict[str, float]:
 
 def _to_jump_param_dict(values: np.ndarray) -> dict[str, float]:
     return {name: float(value) for name, value in zip(PARAM_NAMES_JUMP, values, strict=True)}
+
+
+def _to_svj_param_dict(values: np.ndarray) -> dict[str, float]:
+    return {name: float(value) for name, value in zip(PARAM_NAMES_SVJ, values, strict=True)}
 
 
 def _make_intraday_dt_seq(num_days: int) -> np.ndarray:
@@ -104,200 +115,178 @@ def _save_diagnostic_plot(
     return str(plot_path)
 
 
-def run_heston(
-    seed: int = 7,
-    S0: float = 100.0,
-    length: int = 5000,
-    dt: float = _DT_MIN,
-    true_params: np.ndarray | None = None,
-    popsize: int = 256,
-    num_generations: int = 100,
-    sigma_init: float = 0.1,
-    num_particles: int = 2048,
-    plot_path: str | Path | None = None,
-) -> dict[str, object]:
-    if true_params is None:
-        true_params = np.array([0.04, -0.7, 4.0, 0.04, 0.2, 0.0], dtype=np.float32)
-    else:
-        true_params = np.asarray(true_params, dtype=np.float32)
+def _save_inhomo_diagnostic_plot(
+    opens: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    log_returns: np.ndarray,
+    true_variance: np.ndarray,
+    filtered_variance: np.ndarray,
+    filtered_std: np.ndarray,
+    plot_path: str | Path,
+    true_param_filtered_variance: np.ndarray | None = None,
+) -> str:
+    """Three-panel Plotly diagnostic plot for the Inhomogeneous Heston model.
 
-    log_returns, true_variance = HestonProcess.generator(
-        seed=seed,
-        S0=S0,
-        length=length,
-        dt=dt,
-        params=true_params,
-    )
-    prices = _prices_from_log_returns(S0, log_returns)
+    Panel 1: OHLC candlestick.
+    Panel 2: Log-return bar chart (green = up, red = down).
+    Panel 3: Variance — true path, filtered mean +/- 2σ (fitted params),
+             and optionally filtered mean using true params.
 
-    process = HestonProcess(
-        popsize=popsize,
-        num_generations=num_generations,
-        sigma_init=sigma_init,
-        dt=dt,
-        num_particles=num_particles,
-        S=prices,
-    )
-    setting, dsetting = process.get_default_param(jax.random.PRNGKey(seed))
-
-    fit_key = jax.random.PRNGKey(seed + 1)
-    best_member, bic = process.calibrate(fit_key, setting, dsetting)
-    fitted_params = np.asarray(
-        jax.device_get(process.unconstrained_to_params(best_member)),
-        dtype=np.float32,
-    )
-
-    filter_carry, filter_info = process.loglikelihood(
-        jnp.asarray(fitted_params, dtype=jnp.float32)[None, :],
-        setting,
-        dsetting,
-    )
-
-    filtered_variance = np.asarray(jax.device_get(filter_info.filtered_mean), dtype=np.float32)
-    filtered_std = np.asarray(jax.device_get(filter_info.filtered_std), dtype=np.float32)
-    ess = np.asarray(jax.device_get(filter_info.ess), dtype=np.float32)
-    loglik_increments = np.asarray(jax.device_get(filter_info.loglik_increments), dtype=np.float32)
-    total_loglik = float(jax.device_get(filter_carry[-1][0]))
-    bic = float(jax.device_get(bic))
-
-    result: dict[str, object] = {
-        "prices": prices,
-        "log_returns": log_returns,
-        "true_variance": true_variance,
-        "filtered_variance": filtered_variance,
-        "filtered_std": filtered_std,
-        "ess": ess,
-        "loglik_increments": loglik_increments,
-        "true_params": _to_param_dict(true_params),
-        "fitted_params": _to_param_dict(fitted_params),
-        "best_loglik": total_loglik,
-        "bic": bic,
-        "variance_rmse": float(np.sqrt(np.mean((filtered_variance - true_variance) ** 2))),
-        "mean_ess": float(np.mean(ess)),
-    }
-
-    if plot_path is not None:
-        result["plot_path"] = _save_diagnostic_plot(
-            prices=prices,
-            log_returns=log_returns,
-            true_variance=true_variance,
-            filtered_variance=filtered_variance,
-            filtered_std=filtered_std,
-            plot_path=plot_path,
-        )
-
-    return result
-
-
-def run_heston_jump(
-    seed: int = 7,
-    S0: float = 100.0,
-    num_days: int = 40,
-    true_params: np.ndarray | None = None,
-    popsize: int = 256,
-    num_generations: int = 100,
-    sigma_init: float = 0.5,
-    num_particles: int = 1024,
-    plot_path: str | Path | None = None,
-) -> dict[str, object]:
-    """Run synthetic-data generation, CMA-ES calibration, and particle-filter
-    evaluation for the Heston-with-jumps model at 1-minute resolution.
-
-    The dt_seq encodes 390 intraday 1-min steps followed by one 1050-min
-    overnight gap, repeating for every trading day.
+    Writes an interactive HTML alongside the PNG.  PNG is produced via
+    kaleido when available, otherwise falls back to a Matplotlib render.
     """
-    if true_params is None:
-        true_params = np.array(
-            # v0,   rho,   kappa, theta, sigma, r
-            [0.04, -0.7,   4.0,  0.04,  0.2,   0.0,
-            # p_J,   mu_Jr, sigma_Jr, mu_JV, sigma_JV, rho_J
-             0.50,  0.0,   0.15,     0.0,   0.05,     -0.5],
-            dtype=np.float32,
-        )
-    else:
-        true_params = np.asarray(true_params, dtype=np.float32)
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
 
-    dt_seq_np = _make_intraday_dt_seq(num_days)
-    length    = len(dt_seq_np)
+    plot_path = Path(plot_path)
+    T  = log_returns.shape[0]
+    tl = np.arange(T)
 
-    log_returns, true_variance = HestonJumpProcess.generator(
-        seed=seed,
-        S0=S0,
-        length=length,
-        dt=_DT_MIN,
-        params=true_params,
-        dt_seq=dt_seq_np,
-    )
-    prices = _prices_from_log_returns(S0, log_returns)
-    # plot the prices and true variance to sanity check the data generation
-    # before running the (more expensive) CMA-ES calibration and particle filter
-    if plot_path is not None:
-        _save_diagnostic_plot(
-            prices=prices,
-            log_returns=log_returns,
-            true_variance=true_variance,
-            filtered_variance=true_variance, # just plot the true variance as a sanity check
-            filtered_std=np.zeros_like(true_variance), # no uncertainty bands for the true variance, so set std to zero
-            plot_path=f"data_generation_{plot_path}",
-        )
-    process = HestonJumpProcess(
-        popsize=popsize,
-        num_generations=num_generations,
-        sigma_init=sigma_init,
-        dt=_DT_MIN,
-        num_particles=num_particles,
-        S=prices,
-        dt_seq_np=dt_seq_np,
-    )
-    setting, dsetting = process.get_default_param(jax.random.PRNGKey(seed))
-
-    fit_key = jax.random.PRNGKey(seed + 1)
-    best_member, bic = process.calibrate(fit_key, setting, dsetting)
-    fitted_params = np.asarray(
-        jax.device_get(process.unconstrained_to_params(best_member)),
-        dtype=np.float32,
+    fig = make_subplots(
+        rows=3, cols=1,
+        shared_xaxes=False,
+        subplot_titles=(
+            "Synthetic InhomoHeston OHLC",
+            "Log Returns",
+            "Variance: true / filtered",
+        ),
+        vertical_spacing=0.08,
+        row_heights=[0.4, 0.25, 0.35],
     )
 
-    filter_carry, filter_info = process.loglikelihood(
-        jnp.asarray(fitted_params, dtype=jnp.float32)[None, :],
-        setting,
-        dsetting,
+    # ── Panel 1: candlestick ─────────────────────────────────────────
+    fig.add_trace(
+        go.Candlestick(
+            x=tl,
+            open=opens,
+            high=highs,
+            low=lows,
+            close=closes,
+            name="OHLC",
+            increasing_line_color="limegreen",
+            decreasing_line_color="tomato",
+        ),
+        row=1, col=1,
+    )
+    fig.update_layout(xaxis_rangeslider_visible=False)
+
+    # ── Panel 2: log-return bar chart ────────────────────────────────
+    bar_colors = np.where(log_returns >= 0, "limegreen", "tomato").tolist()
+    fig.add_trace(
+        go.Bar(
+            x=tl,
+            y=log_returns,
+            marker_color=bar_colors,
+            name="Log return",
+            showlegend=False,
+        ),
+        row=2, col=1,
     )
 
-    filtered_variance  = np.asarray(jax.device_get(filter_info.filtered_mean),    dtype=np.float32)
-    filtered_std       = np.asarray(jax.device_get(filter_info.filtered_std),     dtype=np.float32)
-    ess                = np.asarray(jax.device_get(filter_info.ess),              dtype=np.float32)
-    loglik_increments  = np.asarray(jax.device_get(filter_info.loglik_increments),dtype=np.float32)
-    total_loglik       = float(jax.device_get(filter_carry[-1][0]))
-    bic                = float(jax.device_get(bic))
-
-    result: dict[str, object] = {
-        "prices":            prices,
-        "log_returns":       log_returns,
-        "true_variance":     true_variance,
-        "filtered_variance": filtered_variance,
-        "filtered_std":      filtered_std,
-        "ess":               ess,
-        "loglik_increments": loglik_increments,
-        "true_params":       _to_jump_param_dict(true_params),
-        "fitted_params":     _to_jump_param_dict(fitted_params),
-        "best_loglik":       total_loglik,
-        "bic":               bic,
-        "variance_rmse":     float(np.sqrt(np.mean((filtered_variance - true_variance) ** 2))),
-        "mean_ess":          float(np.mean(ess)),
-    }
-
-    if plot_path is not None:
-        result["plot_path"] = _save_diagnostic_plot(
-            prices=prices,
-            log_returns=log_returns,
-            true_variance=true_variance,
-            filtered_variance=filtered_variance,
-            filtered_std=filtered_std,
-            plot_path=plot_path,
+    # ── Panel 3: variance ────────────────────────────────────────────
+    fig.add_trace(
+        go.Scatter(
+            x=tl, y=true_variance, mode="lines",
+            line=dict(color="royalblue", width=1.5),
+            name="true variance",
+        ),
+        row=3, col=1,
+    )
+    lower = np.maximum(filtered_variance - 2.0 * filtered_std, 0.0)
+    upper = filtered_variance + 2.0 * filtered_std
+    fig.add_trace(
+        go.Scatter(
+            x=np.concatenate([tl, tl[::-1]]),
+            y=np.concatenate([upper, lower[::-1]]),
+            fill="toself",
+            fillcolor="rgba(255,165,0,0.15)",
+            line=dict(color="rgba(255,165,0,0)"),
+            name="filtered ±2σ (fitted)",
+        ),
+        row=3, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=tl, y=filtered_variance, mode="lines",
+            line=dict(color="darkorange", width=1.5),
+            name="filtered mean (fitted)",
+        ),
+        row=3, col=1,
+    )
+    if true_param_filtered_variance is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=tl, y=true_param_filtered_variance, mode="lines",
+                line=dict(color="purple", width=1.2, dash="dash"),
+                name="filtered mean (true params)",
+            ),
+            row=3, col=1,
         )
 
-    return result
+    fig.update_layout(
+        height=900,
+        title_text="InhomoHeston OHLC Diagnostic",
+        template="plotly_white",
+        legend=dict(orientation="v", x=1.01, y=0.5),
+    )
+    fig.update_yaxes(title_text="Price",      row=1, col=1)
+    fig.update_yaxes(title_text="Log return", row=2, col=1)
+    fig.update_yaxes(title_text="Variance",   row=3, col=1)
+    fig.update_xaxes(title_text="Time step",  row=3, col=1)
+
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(str(plot_path.with_suffix(".html")))
+
+    try:
+        fig.write_image(str(plot_path), scale=2, engine="kaleido")
+        return str(plot_path)
+    except Exception:
+        # Fallback: Matplotlib static render
+        from matplotlib.patches import Rectangle
+
+        x = np.arange(T)
+        figm, axs = plt.subplots(3, 1, figsize=(12, 9), sharex=False)
+
+        ax0 = axs[0]
+        width = 0.6
+        for i in range(T):
+            o, h, l, c = float(opens[i]), float(highs[i]), float(lows[i]), float(closes[i])
+            color = "limegreen" if c >= o else "tomato"
+            ax0.vlines(x[i], l, h, color=color, linewidth=0.6)
+            rect_y = min(o, c)
+            rect_h = max(abs(c - o), 1e-8)
+            ax0.add_patch(Rectangle(
+                (x[i] - width / 2.0, rect_y), width, rect_h,
+                facecolor=color, edgecolor=color, linewidth=0.3,
+            ))
+        ax0.autoscale_view()
+        ax0.set_title("Synthetic InhomoHeston OHLC")
+        ax0.set_ylabel("Price")
+
+        colors = np.where(log_returns >= 0, "limegreen", "tomato")
+        axs[1].bar(x, log_returns, color=colors, width=1.0, linewidth=0)
+        axs[1].axhline(0, color="black", linewidth=0.5)
+        axs[1].set_title("Log Returns")
+        axs[1].set_ylabel("Log return")
+
+        axs[2].plot(x, true_variance, color="royalblue", linewidth=1.2, label="true variance")
+        axs[2].fill_between(x, lower, upper, alpha=0.15, color="orange", label="filtered ±2σ (fitted)")
+        axs[2].plot(x, filtered_variance, color="darkorange", linewidth=1.2, label="filtered mean (fitted)")
+        if true_param_filtered_variance is not None:
+            axs[2].plot(x, true_param_filtered_variance, color="purple", linewidth=1.0,
+                        linestyle="--", label="filtered mean (true params)")
+        axs[2].set_title("Variance: true / filtered")
+        axs[2].set_ylabel("Variance")
+        axs[2].set_xlabel("Time step")
+        axs[2].legend(loc="upper right", fontsize=8)
+
+        figm.tight_layout()
+        figm.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close(figm)
+        return str(plot_path)
+
 
 
 def _to_inhomo_param_dict(values: np.ndarray) -> dict[str, float]:
@@ -390,14 +379,14 @@ def _save_sv_diagnostic_plot(
 
 
 def run_semivariance_heston(
-    seed: int = 10,
+    seed: int = 15,
     S0: float = 100.0,
-    num_days: int = 60,
+    num_days: int = 40,
     true_params: np.ndarray | None = None,
     popsize: int = 256,
-    num_generations: int = 200,
+    num_generations: int = 100,
     sigma_init: float = 0.8,
-    num_particles: int = 4096,
+    num_particles: int = 2048,
     plot_path: str | Path | None = None,
 ) -> dict[str, object]:
     """Run synthetic-data generation, CMA-ES calibration, and APF evaluation
@@ -581,9 +570,9 @@ def run_semivariance_heston(
 
 
 def run_inhomo_heston(
-    seed: int = 9,
+    seed: int = 10,
     S0: float = 100.0,
-    num_days: int = 40,
+    num_days: int = 30,
     true_params: np.ndarray | None = None,
     popsize: int = 256,
     num_generations: int = 100,
@@ -602,7 +591,7 @@ def run_inhomo_heston(
         seed:            RNG seed.
         S0:              Initial price.
         num_days:        Number of simulated trading days.
-        true_params:     Shape-(7,) array [v0, rho, kappa, theta, sigma, r, lambda_ov].
+        true_params:     Shape-(8,) array [v0, rho, kappa, theta, sigma, r, lambda_ov, alpha_rs].
                          Defaults to a reasonable set if None.
         popsize:         CMA-ES population size.
         num_generations: CMA-ES iteration budget.
@@ -618,22 +607,27 @@ def run_inhomo_heston(
     """
     if true_params is None:
         true_params = np.array(
-            [0.04, -0.7, 4.0, 0.04, 0.2, 0.0, 0.2], dtype=np.float32
+            [0.04, -0.7, 4.0, 0.04, 0.2, 0.0, 0.1, 2.0], dtype=np.float32
         )
     else:
         true_params = np.asarray(true_params, dtype=np.float32)
 
-    log_returns, true_variance = InhomoHestonProcess.generator(
-        seed=seed,
-        S0=S0,
-        num_days=num_days,
-        params=true_params,
-    )
+    log_returns, true_variance, opens, highs, lows, rs_variances = \
+        InhomoHestonProcess.generator(
+            seed=seed,
+            S0=S0,
+            num_days=num_days,
+            params=true_params,
+        )
     prices = _prices_from_log_returns(S0, log_returns)
+    closes = prices[1:]  # close for each bar = price after the bar
 
     if plot_path is not None:
-        _save_diagnostic_plot(
-            prices=prices,
+        _save_inhomo_diagnostic_plot(
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
             log_returns=log_returns,
             true_variance=true_variance,
             filtered_variance=true_variance,
@@ -649,6 +643,7 @@ def run_inhomo_heston(
         num_particles=num_particles,
         S=prices,
         rho_cpm=0.99,
+        rs_data=rs_variances,
     )
     setting, dsetting = process.get_default_param(jax.random.PRNGKey(seed))
 
@@ -690,7 +685,12 @@ def run_inhomo_heston(
 
     result: dict[str, object] = {
         "prices":            prices,
+        "opens":             opens,
+        "highs":             highs,
+        "lows":              lows,
+        "closes":            closes,
         "log_returns":       log_returns,
+        "rs_variances":      rs_variances,
         "true_variance":     true_variance,
         "filtered_variance": filtered_variance,
         "filtered_std":      filtered_std,
@@ -710,14 +710,193 @@ def run_inhomo_heston(
     }
 
     if plot_path is not None:
-        result["plot_path"] = _save_diagnostic_plot(
-            prices=prices,
+        result["plot_path"] = _save_inhomo_diagnostic_plot(
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
             log_returns=log_returns,
             true_variance=true_variance,
             filtered_variance=filtered_variance,
             filtered_std=filtered_std,
             plot_path=plot_path,
             true_param_filtered_variance=true_param_filtered_variance,
+        )
+
+    return result
+
+
+def run_real_inhomo_heston(
+    root: str,
+    num_steps: int = 20000,
+    seed: int = 0,
+    popsize: int = 256,
+    num_generations: int = 100,
+    sigma_init: float = 0.8,
+    num_particles: int = 4096,
+    plot_path: str | Path | None = None,
+    db_name: str = "stock",
+    db_username: str = "metis",
+    db_password: str = "123456",
+) -> dict[str, object]:
+    """Calibrate InhomoHestonProcess on real 1-min OHLCV data from the database.
+
+    Loads ``num_steps + 1`` rows (RTH 1-min bars) for ``root`` from MySQL,
+    preprocesses the price series, Rogers-Satchell variance, and dt sequence,
+    then runs CMA-ES calibration followed by an APF filter pass.
+
+    Args:
+        root:            Ticker symbol (e.g. ``"SPY"``).
+        num_steps:       Number of log-return steps to use (default 20 000).
+                         ``num_steps + 1`` rows are loaded from the database.
+        seed:            JAX PRNG seed for noise pre-generation.
+        popsize:         CMA-ES population size.
+        num_generations: CMA-ES iteration budget.
+        sigma_init:      CMA-ES initial step-size.
+        num_particles:   APF particle count.
+        plot_path:       If given, saves a Plotly diagnostic HTML/PNG at this path.
+        db_name:         MySQL database name.
+        db_username:     MySQL username.
+        db_password:     MySQL password.
+
+    Returns:
+        Dictionary with keys: root, S, opens, highs, lows, closes,
+        rs_data, rs_variance_proxy, dt_seq, log_returns,
+        filtered_variance, filtered_std, ess, loglik_increments,
+        fitted_params, best_loglik, bic, mean_ess, [plot_path].
+    """
+    import sys
+    import os
+    import pandas as pd
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "data"))
+    from data.database import Database
+
+    # ── Load data ──────────────────────────────────────────────────────
+    db = Database(db_name=db_name, db_username=db_username, db_password=db_password)
+    df = db.load(root=root, start_date=20000101, end_date=21001231)
+    if df is None or len(df) == 0:
+        raise ValueError(f"No data found for root='{root}'")
+
+    df = df.sort_values("date").reset_index(drop=True)
+    need = num_steps + 1
+    if len(df) < need:
+        raise ValueError(
+            f"Only {len(df)} rows available for root='{root}', need {need}"
+        )
+    df = df.iloc[-need:].reset_index(drop=True)   # shape (T+1, ...)
+
+    T = num_steps
+
+    # ── Price series S ─────────────────────────────────────────────────
+    # S[i] = close of bar i; log_return[i] = log(S[i+1] / S[i])
+    S = df["close"].values.astype(np.float32)    # (T+1,)
+
+    # ── dt sequence ────────────────────────────────────────────────────
+    # Transition i → i+1: overnight if the two bars fall on different
+    # calendar days, otherwise one intraday minute.
+    dates   = pd.to_datetime(df["date"])
+    day_arr = dates.dt.date.values
+    is_overnight = (day_arr[1:] != day_arr[:-1])  # (T,) bool
+    dt_seq = np.where(is_overnight, _DT_OVERNIGHT, _DT_MIN).astype(np.float32)  # (T,)
+
+    # ── Rogers-Satchell variance ───────────────────────────────────────
+    # rs[i] measures within-bar variance for bar i+1 (the bar whose close
+    # price becomes S[i+1]).  Uses log-OHLC relative to the bar's open.
+    #   h = log(H/O),  l = log(L/O),  c = log(C/O)
+    #   RS = h*(h-c) + l*(l-c)
+    eps = np.float64(1e-10)
+    open_  = df["open"].values[1:].astype(np.float64)
+    high   = df["high"].values[1:].astype(np.float64)
+    low    = df["low"].values[1:].astype(np.float64)
+    close  = df["close"].values[1:].astype(np.float64)
+
+    h = np.log(np.maximum(high,  eps) / np.maximum(open_, eps))
+    l = np.log(np.maximum(low,   eps) / np.maximum(open_, eps))
+    c = np.log(np.maximum(close, eps) / np.maximum(open_, eps))
+    rs_data = np.maximum(h * (h - c) + l * (l - c), 1e-10).astype(np.float32)  # (T,)
+
+    # RS-based annualised variance proxy for plotting (intraday bars only;
+    # overnight bars have artificially large dt so we clip them out).
+    dt_intra = np.where(is_overnight, _DT_MIN, dt_seq)
+    rs_variance_proxy = (rs_data / dt_intra).astype(np.float32)                 # (T,)
+
+    # ── OHLC price arrays for the candlestick panel ────────────────────
+    opens  = df["open"].values[1:].astype(np.float32)
+    highs  = df["high"].values[1:].astype(np.float32)
+    lows   = df["low"].values[1:].astype(np.float32)
+    closes = df["close"].values[1:].astype(np.float32)   # == S[1:]
+
+    log_returns = np.log(S[1:] / S[:-1]).astype(np.float32)  # (T,)
+
+    # ── Build process and override dt_seq / rs_seq ─────────────────────
+    process = InhomoHestonProcess(
+        popsize=popsize,
+        num_generations=num_generations,
+        sigma_init=sigma_init,
+        dt=float(_DT_MIN),
+        num_particles=num_particles,
+        S=S,
+        rho_cpm=0.99,
+        rs_data=rs_data,
+    )
+    setting, dsetting = process.get_default_param(jax.random.PRNGKey(seed))
+    # Replace the synthetic dt_seq with the real one.
+    dsetting = dsetting.replace(dt_seq=jnp.array(dt_seq, dtype=jnp.float32))
+
+    # ── CMA-ES calibration ─────────────────────────────────────────────
+    fit_key = jax.random.PRNGKey(seed + 1)
+    best_member, bic = process.calibrate(fit_key, setting, dsetting)
+    fitted_params = np.asarray(
+        jax.device_get(process.unconstrained_to_params(best_member)),
+        dtype=np.float32,
+    )
+
+    # ── APF filter pass with fitted parameters ─────────────────────────
+    filter_carry, filter_info = process.loglikelihood(
+        jnp.asarray(fitted_params, dtype=jnp.float32)[None, :],
+        setting,
+        dsetting,
+    )
+
+    filtered_variance  = np.asarray(jax.device_get(filter_info.filtered_mean),     dtype=np.float32)
+    filtered_std       = np.asarray(jax.device_get(filter_info.filtered_std),      dtype=np.float32)
+    ess                = np.asarray(jax.device_get(filter_info.ess),               dtype=np.float32)
+    loglik_increments  = np.asarray(jax.device_get(filter_info.loglik_increments), dtype=np.float32)
+    total_loglik       = float(jax.device_get(filter_carry[-1][0]))
+    bic                = float(jax.device_get(bic))
+
+    result: dict[str, object] = {
+        "root":               root,
+        "S":                  S,
+        "opens":              opens,
+        "highs":              highs,
+        "lows":               lows,
+        "closes":             closes,
+        "log_returns":        log_returns,
+        "rs_data":            rs_data,
+        "rs_variance_proxy":  rs_variance_proxy,
+        "dt_seq":             dt_seq,
+        "filtered_variance":  filtered_variance,
+        "filtered_std":       filtered_std,
+        "ess":                ess,
+        "loglik_increments":  loglik_increments,
+        "fitted_params":      _to_inhomo_param_dict(fitted_params),
+        "best_loglik":        total_loglik,
+        "bic":                bic,
+        "mean_ess":           float(np.mean(ess)),
+    }
+
+    if plot_path is not None:
+        result["plot_path"] = _save_inhomo_diagnostic_plot(
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            log_returns=log_returns,
+            true_variance=rs_variance_proxy,
+            filtered_variance=filtered_variance,
+            filtered_std=filtered_std,
+            plot_path=plot_path,
         )
 
     return result
@@ -849,30 +1028,486 @@ def run_qrh(
     return result
 
 
-def main() -> None:
-    # print("=== Heston (no jumps) ===")
-    # result = run_heston(plot_path="heston_diagnostic_plot.png")
-    # summary = {
-    #     "true_params":   result["true_params"],
-    #     "fitted_params": result["fitted_params"],
-    #     "best_loglik":   result["best_loglik"],
-    #     "bic":           result["bic"],
-    #     "variance_rmse": result["variance_rmse"],
-    #     "mean_ess":      result["mean_ess"],
-    # }
-    # print(json.dumps(summary, indent=2, sort_keys=True))
+def _save_jump_diagnostic_plot(
+    prices: np.ndarray,
+    log_returns: np.ndarray,
+    true_variance: np.ndarray,
+    filtered_variance: np.ndarray,
+    filtered_std: np.ndarray,
+    plot_path: str | Path,
+    true_param_filtered_variance: np.ndarray | None = None,
+) -> str:
+    """Three-panel Plotly diagnostic plot for the Heston-Jump model.
 
-    # print("\n=== Heston-Jump (1-min intraday + 1050-min overnight) ===")
-    # result_jump = run_heston_jump(plot_path="heston_jump_diagnostic_plot.png")
-    # summary_jump = {
-    #     "true_params":   result_jump["true_params"],
-    #     "fitted_params": result_jump["fitted_params"],
-    #     "best_loglik":   result_jump["best_loglik"],
-    #     "bic":           result_jump["bic"],
-    #     "variance_rmse": result_jump["variance_rmse"],
-    #     "mean_ess":      result_jump["mean_ess"],
-    # }
-    # print(json.dumps(summary_jump, indent=2, sort_keys=True))
+    Panel 1: Synthetic price path.
+    Panel 2: Log-return bar chart (green = up, red = down).
+    Panel 3: Variance — true path, filtered mean ±2σ (fitted params),
+             and optionally filtered mean using true params.
+
+    Writes an interactive HTML alongside the PNG.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    plot_path = Path(plot_path)
+    T  = log_returns.shape[0]
+    tl = np.arange(T)
+    pl = np.arange(prices.shape[0])
+
+    fig = make_subplots(
+        rows=3, cols=1,
+        shared_xaxes=False,
+        subplot_titles=(
+            "Synthetic HestonJump Price Path",
+            "Log Returns",
+            "Variance: true / filtered",
+        ),
+        vertical_spacing=0.08,
+        row_heights=[0.35, 0.25, 0.40],
+    )
+
+    # ── Panel 1: price path ──────────────────────────────────────────
+    fig.add_trace(
+        go.Scatter(
+            x=pl, y=prices, mode="lines",
+            line=dict(color="steelblue", width=1.2),
+            name="Price",
+        ),
+        row=1, col=1,
+    )
+
+    # ── Panel 2: log-return bar chart ────────────────────────────────
+    bar_colors = np.where(log_returns >= 0, "limegreen", "tomato").tolist()
+    fig.add_trace(
+        go.Bar(
+            x=tl, y=log_returns,
+            marker_color=bar_colors,
+            name="Log return",
+            showlegend=False,
+        ),
+        row=2, col=1,
+    )
+
+    # ── Panel 3: variance ────────────────────────────────────────────
+    fig.add_trace(
+        go.Scatter(
+            x=tl, y=true_variance, mode="lines",
+            line=dict(color="royalblue", width=1.5),
+            name="true variance",
+        ),
+        row=3, col=1,
+    )
+    lower = np.maximum(filtered_variance - 2.0 * filtered_std, 0.0)
+    upper = filtered_variance + 2.0 * filtered_std
+    fig.add_trace(
+        go.Scatter(
+            x=np.concatenate([tl, tl[::-1]]),
+            y=np.concatenate([upper, lower[::-1]]),
+            fill="toself",
+            fillcolor="rgba(255,165,0,0.15)",
+            line=dict(color="rgba(255,165,0,0)"),
+            name="filtered ±2σ (fitted)",
+        ),
+        row=3, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=tl, y=filtered_variance, mode="lines",
+            line=dict(color="darkorange", width=1.5),
+            name="filtered mean (fitted)",
+        ),
+        row=3, col=1,
+    )
+    if true_param_filtered_variance is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=tl, y=true_param_filtered_variance, mode="lines",
+                line=dict(color="purple", width=1.2, dash="dash"),
+                name="filtered mean (true params)",
+            ),
+            row=3, col=1,
+        )
+
+    fig.update_layout(
+        height=900,
+        title_text="HestonJump Diagnostic",
+        template="plotly_white",
+        legend=dict(orientation="v", x=1.01, y=0.5),
+    )
+    fig.update_yaxes(title_text="Price",      row=1, col=1)
+    fig.update_yaxes(title_text="Log return", row=2, col=1)
+    fig.update_yaxes(title_text="Variance",   row=3, col=1)
+    fig.update_xaxes(title_text="Time step",  row=3, col=1)
+
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(str(plot_path.with_suffix(".html")))
+
+    try:
+        fig.write_image(str(plot_path), scale=2, engine="kaleido")
+        return str(plot_path)
+    except Exception:
+        # Fallback: Matplotlib static render
+        x = np.arange(T)
+        figm, axs = plt.subplots(3, 1, figsize=(12, 9), sharex=False)
+
+        axs[0].plot(pl, prices, color="steelblue", linewidth=1.2)
+        axs[0].set_title("Synthetic HestonJump Price Path")
+        axs[0].set_ylabel("Price")
+
+        colors = np.where(log_returns >= 0, "limegreen", "tomato")
+        axs[1].bar(x, log_returns, color=colors, width=1.0, linewidth=0)
+        axs[1].axhline(0, color="black", linewidth=0.5)
+        axs[1].set_title("Log Returns")
+        axs[1].set_ylabel("Log return")
+
+        axs[2].plot(x, true_variance,    color="royalblue",  linewidth=1.2, label="true variance")
+        axs[2].fill_between(x, lower, upper, alpha=0.15, color="orange", label="filtered ±2σ (fitted)")
+        axs[2].plot(x, filtered_variance, color="darkorange", linewidth=1.2, label="filtered mean (fitted)")
+        if true_param_filtered_variance is not None:
+            axs[2].plot(x, true_param_filtered_variance, color="purple",
+                        linewidth=1.0, linestyle="--", label="filtered mean (true params)")
+        axs[2].set_title("Variance: true / filtered")
+        axs[2].set_ylabel("Variance")
+        axs[2].set_xlabel("Time step")
+        axs[2].legend(loc="upper right", fontsize=8)
+
+        figm.tight_layout()
+        figm.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close(figm)
+        return str(plot_path)
+
+
+def run_heston_jump(
+    seed: int = 20,
+    S0: float = 100.0,
+    num_days: int = 30,
+    true_params: np.ndarray | None = None,
+    popsize: int = 16,
+    num_generations: int = 100,
+    sigma_init: float = 0.8,
+    num_particles: int = 4096,
+    plot_path: str | Path | None = None,
+) -> dict[str, object]:
+    """Run synthetic-data generation, CMA-ES calibration, and APF evaluation
+    for the Heston-Jump model.
+
+    Data layout: ``390 × num_days`` steps, all at ``dt = 1 minute``.
+    There are no special overnight dt values; overnight price gaps are
+    described by the correlated jump process.
+
+    Risk-neutral property is maintained via the per-step compensator::
+
+        comp = log[(1 - p_J) + p_J · exp(μ_Jr + ½σ_Jr²)]
+
+    Args:
+        seed:            RNG seed.
+        S0:              Initial price.
+        num_days:        Number of simulated trading days (390 steps each).
+        true_params:     Shape-(12,) array
+                         ``[v0, rho, kappa, theta, sigma, r,
+                            p_J, mu_Jr, sigma_Jr, mu_JV, sigma_JV, rho_J]``.
+                         Defaults to a realistic jump parameter set.
+        popsize:         CMA-ES population size.
+        num_generations: CMA-ES iteration budget.
+        sigma_init:      CMA-ES initial step-size.
+        num_particles:   APF particle count.
+        plot_path:       If given, saves a diagnostic HTML/PNG at this path.
+
+    Returns:
+        Dictionary with keys:
+            prices, log_returns, true_variance,
+            filtered_variance, filtered_std, ess, loglik_increments,
+            true_params, fitted_params, best_loglik, bic,
+            variance_rmse, mean_ess,
+            true_param_filtered_variance, true_param_loglik,
+            true_param_variance_rmse, [plot_path].
+    """
+    if true_params is None:
+        true_params = np.array(
+            [
+                0.04,   # v0
+               -0.6,    # rho
+                3.0,    # kappa
+                0.04,   # theta
+                0.3,    # sigma
+                0.0,    # r
+                100,   # lambda_J  
+               -0.01,   # mu_Jr — small negative mean jump
+                0.05,   # sigma_Jr
+                0.01,    # mu_JV — variance jumps upward on average
+                0.05,    # sigma_JV
+               -0.5,    # rho_J — large variance jumps → negative return jumps
+            ],
+            dtype=np.float32,
+        )
+    else:
+        true_params = np.asarray(true_params, dtype=np.float32)
+
+    log_returns, true_variance = HestonJumpProcess.generator(
+        seed=seed,
+        S0=S0,
+        num_days=num_days,
+        params=true_params,
+    )
+    prices = _prices_from_log_returns(S0, log_returns)
+
+    # Data-generation sanity plot (true variance, no filter pass yet).
+    if plot_path is not None:
+        _save_jump_diagnostic_plot(
+            prices=prices,
+            log_returns=log_returns,
+            true_variance=true_variance,
+            filtered_variance=true_variance,
+            filtered_std=np.zeros_like(true_variance),
+            plot_path=f"data_generation_{plot_path}",
+        )
+
+    process = HestonJumpProcess(
+        popsize=popsize,
+        num_generations=num_generations,
+        sigma_init=sigma_init,
+        dt=float(_DT_MIN),
+        num_particles=num_particles,
+        S=prices,
+        rho_cpm=0.99,
+        
+    )
+    setting, dsetting = process.get_default_param(jax.random.PRNGKey(seed))
+
+    fit_key = jax.random.PRNGKey(seed + 1)
+    best_member, bic = process.calibrate(fit_key, setting, dsetting)
+    fitted_params = np.asarray(
+        jax.device_get(process.unconstrained_to_params(best_member)),
+        dtype=np.float32,
+    )
+
+    # APF filter pass with fitted parameters.
+    filter_carry, filter_info = process.loglikelihood(
+        jnp.asarray(fitted_params, dtype=jnp.float32)[None, :],
+        setting,
+        dsetting,
+    )
+
+    # APF filter pass with true parameters (upper-bound reference).
+    true_filter_carry, true_filter_info = process.loglikelihood(
+        jnp.asarray(true_params, dtype=jnp.float32)[None, :],
+        setting,
+        dsetting,
+    )
+
+    filtered_variance  = np.asarray(jax.device_get(filter_info.filtered_mean),      dtype=np.float32)
+    filtered_std       = np.asarray(jax.device_get(filter_info.filtered_std),       dtype=np.float32)
+    ess                = np.asarray(jax.device_get(filter_info.ess),                dtype=np.float32)
+    loglik_increments  = np.asarray(jax.device_get(filter_info.loglik_increments),  dtype=np.float32)
+    total_loglik       = float(jax.device_get(filter_carry[-1][0]))
+    bic_val            = float(jax.device_get(bic))
+
+    true_param_filtered_variance = np.asarray(
+        jax.device_get(true_filter_info.filtered_mean), dtype=np.float32
+    )
+    true_param_loglik = float(jax.device_get(true_filter_carry[-1][0]))
+
+    result: dict[str, object] = {
+        "prices":            prices,
+        "log_returns":       log_returns,
+        "true_variance":     true_variance,
+        "filtered_variance": filtered_variance,
+        "filtered_std":      filtered_std,
+        "ess":               ess,
+        "loglik_increments": loglik_increments,
+        "true_params":       _to_jump_param_dict(true_params),
+        "fitted_params":     _to_jump_param_dict(fitted_params),
+        "best_loglik":       total_loglik,
+        "bic":               bic_val,
+        "variance_rmse":     float(np.sqrt(np.mean((filtered_variance - true_variance) ** 2))),
+        "mean_ess":          float(np.mean(ess)),
+        "true_param_filtered_variance": true_param_filtered_variance,
+        "true_param_loglik":            true_param_loglik,
+        "true_param_variance_rmse": float(
+            np.sqrt(np.mean((true_param_filtered_variance - true_variance) ** 2))
+        ),
+    }
+
+    if plot_path is not None:
+        result["plot_path"] = _save_jump_diagnostic_plot(
+            prices=prices,
+            log_returns=log_returns,
+            true_variance=true_variance,
+            filtered_variance=filtered_variance,
+            filtered_std=filtered_std,
+            plot_path=plot_path,
+            true_param_filtered_variance=true_param_filtered_variance,
+        )
+
+    return result
+
+
+def run_svlogv_jump(
+    seed: int = 20,
+    S0: float = 100.0,
+    num_days: int = 30,
+    true_params: np.ndarray | None = None,
+    popsize: int = 128,
+    num_generations: int = 100,
+    sigma_init: float = 0.8,
+    num_particles: int = 4096,
+    plot_path: str | Path | None = None,
+) -> dict[str, object]:
+    """Run synthetic-data generation, CMA-ES calibration, and RB-APF evaluation
+    for the Stochastic Volatility Log-Variance Jump model.
+
+    The latent state is ``ell_t = log(V_t)`` driven by an OU process with
+    additive Gaussian jumps shared with the log-return.  Inference uses a
+    fully-adapted RB-APF: pilot weights equal the exact marginal likelihood,
+    propagation samples from the Kalman posterior Gaussian mixture, and all
+    correction weights are exactly 1/N — no second resampling stage.
+
+    Args:
+        seed:            RNG seed.
+        S0:              Initial price.
+        num_days:        Number of simulated trading days (390 steps each).
+        true_params:     Shape-(12,) array
+                         ``[ell0, kappa, theta, sigma_v, rho, r,
+                            lambda_J, mu_JS, sigma_JS, mu_JV, sigma_JV, rho_J]``.
+                         Defaults to a realistic parameter set.
+        popsize:         CMA-ES population size.
+        num_generations: CMA-ES iteration budget.
+        sigma_init:      CMA-ES initial step-size.
+        num_particles:   APF particle count.
+        plot_path:       If given, saves a diagnostic HTML/PNG at this path.
+
+    Returns:
+        Dictionary with keys:
+            prices, log_returns, true_variance, true_log_variance,
+            filtered_variance, filtered_std, ess, loglik_increments,
+            true_params, fitted_params, best_loglik, bic,
+            variance_rmse, mean_ess,
+            true_param_filtered_variance, true_param_loglik,
+            true_param_variance_rmse, [plot_path].
+    """
+    import math
+    if true_params is None:
+        true_params = np.array(
+            [
+                math.log(0.20),  # lnv0  — log(20% annualised vol squared)
+                4.0,             # kappa — OU mean-reversion speed
+                math.log(0.08),  # theta — long-run log-variance
+                1.2,             # sigma_v
+               -0.7,             # rho
+                0.0,             # r
+                25.0,           # lambda_J — 50 jumps/year
+               -0.01,            # mu_JS — small negative mean return jump
+                0.08,            # sigma_JS
+               -0.02,             # mu_JV — variance jumps tend upward in log-space
+                0.08,             # sigma_JV — substantial log-variance jump uncertainty
+               -0.5,             # rho_J — large vol jumps → negative return jumps
+            ],
+            dtype=np.float32,
+        )
+    else:
+        true_params = np.asarray(true_params, dtype=np.float32)
+    # jax.config.update("jax_disable_jit", True)
+    log_returns, true_log_variance = StochasticVolatilityJumpProcess.generator(
+        seed=seed,
+        S0=S0,
+        num_days=num_days,
+        params=true_params,
+    )
+    true_variance = np.exp(true_log_variance)   # back to variance units for plotting
+    prices = _prices_from_log_returns(S0, log_returns)
+
+    if plot_path is not None:
+        _save_jump_diagnostic_plot(
+            prices=prices,
+            log_returns=log_returns,
+            true_variance=true_variance,
+            filtered_variance=true_variance,
+            filtered_std=np.zeros_like(true_variance),
+            plot_path=f"data_generation_{plot_path}",
+        )
+    
+    process = StochasticVolatilityJumpProcess(
+        popsize=popsize,
+        num_generations=num_generations,
+        sigma_init=sigma_init,
+        dt=float(_DT_MIN),
+        num_particles=num_particles,
+        S=prices,
+        rho_cpm=0.5,
+    )
+    setting, dsetting = process.get_default_param(jax.random.PRNGKey(seed))
+
+    fit_key = jax.random.PRNGKey(seed + 1)
+    best_member, bic = process.calibrate(fit_key, setting, dsetting)
+    fitted_params = np.asarray(
+        jax.device_get(process.unconstrained_to_params(best_member)),
+        dtype=np.float32,
+    )
+
+    # RB-APF filter pass with fitted parameters.
+    filter_carry, filter_info = process.loglikelihood(
+        jnp.asarray(fitted_params, dtype=jnp.float32)[None, :],
+        setting,
+        dsetting,
+    )
+
+    # RB-APF filter pass with true parameters (upper-bound reference).
+    true_filter_carry, true_filter_info = process.loglikelihood(
+        jnp.asarray(true_params, dtype=jnp.float32)[None, :],
+        setting,
+        dsetting,
+    )
+
+    filtered_variance  = np.asarray(jax.device_get(filter_info.filtered_mean),     dtype=np.float32)
+    filtered_std       = np.asarray(jax.device_get(filter_info.filtered_std),      dtype=np.float32)
+    ess                = np.asarray(jax.device_get(filter_info.ess),               dtype=np.float32)
+    loglik_increments  = np.asarray(jax.device_get(filter_info.loglik_increments), dtype=np.float32)
+    total_loglik       = float(jax.device_get(filter_carry[-1][0]))
+    bic_val            = float(jax.device_get(bic))
+
+    true_param_filtered_variance = np.asarray(
+        jax.device_get(true_filter_info.filtered_mean), dtype=np.float32
+    )
+    true_param_loglik = float(jax.device_get(true_filter_carry[-1][0]))
+
+    result: dict[str, object] = {
+        "prices":            prices,
+        "log_returns":       log_returns,
+        "true_variance":     true_variance,
+        "true_log_variance": true_log_variance,
+        "filtered_variance": filtered_variance,
+        "filtered_std":      filtered_std,
+        "ess":               ess,
+        "loglik_increments": loglik_increments,
+        "true_params":       _to_svj_param_dict(true_params),
+        "fitted_params":     _to_svj_param_dict(fitted_params),
+        "best_loglik":       total_loglik,
+        "bic":               bic_val,
+        "variance_rmse":     float(np.sqrt(np.mean((filtered_variance - true_variance) ** 2))),
+        "mean_ess":          float(np.mean(ess)),
+        "true_param_filtered_variance": true_param_filtered_variance,
+        "true_param_loglik":            true_param_loglik,
+        "true_param_variance_rmse": float(
+            np.sqrt(np.mean((true_param_filtered_variance - true_variance) ** 2))
+        ),
+    }
+
+    if plot_path is not None:
+        result["plot_path"] = _save_jump_diagnostic_plot(
+            prices=prices,
+            log_returns=log_returns,
+            true_variance=true_variance,
+            filtered_variance=filtered_variance,
+            filtered_std=filtered_std,
+            plot_path=plot_path,
+            true_param_filtered_variance=true_param_filtered_variance,
+        )
+
+    return result
+
+
+def main() -> None:
+
 
     # print("\n=== Inhomogeneous Heston (sub-stepped overnight variance) ===")
     # result_ih = run_inhomo_heston(plot_path="inhomo_heston_diagnostic_plot.png")
@@ -887,6 +1522,22 @@ def main() -> None:
     #     "mean_ess":                 result_ih["mean_ess"],
     # }
     # print(json.dumps(summary_ih, indent=2, sort_keys=True))
+    # run_real_inhomo_heston(
+    #     root="QQQ",plot_path="real_inhomo_heston_diagnostic_plot.png")
+
+    print("\n=== SVLogV-Jump model (RB-APF) ===")
+    result_svj = run_svlogv_jump(plot_path="svlogv_jump_diagnostic_plot.png")
+    summary_svj = {
+        "true_params":              result_svj["true_params"],
+        "fitted_params":            result_svj["fitted_params"],
+        "true_param_loglik":        result_svj["true_param_loglik"],
+        "best_loglik":              result_svj["best_loglik"],
+        "bic":                      result_svj["bic"],
+        "variance_rmse":            result_svj["variance_rmse"],
+        "true_param_variance_rmse": result_svj["true_param_variance_rmse"],
+        "mean_ess":                 result_svj["mean_ess"],
+    }
+    print(json.dumps(summary_svj, indent=2, sort_keys=True))
 
     # print("\n=== Quadratic Rough Heston+ (QRH+) ===")
     # result_qrh = run_qrh(plot_path="qrh_diagnostic_plot.png")
@@ -902,23 +1553,23 @@ def main() -> None:
     # }
     # print(json.dumps(summary_qrh, indent=2, sort_keys=True))
 
-    print("\n=== Semivariance Heston (two correlated CIR processes) ===")
-    result_sv = run_semivariance_heston(
-        plot_path="semivariance_heston_diagnostic_plot.png"
-    )
-    summary_sv = {
-        "true_params":               result_sv["true_params"],
-        "fitted_params":             result_sv["fitted_params"],
-        "true_param_loglik":         result_sv["true_param_loglik"],
-        "best_loglik":               result_sv["best_loglik"],
-        "bic":                       result_sv["bic"],
-        "variance_rmse_p":           result_sv["variance_rmse_p"],
-        "variance_rmse_m":           result_sv["variance_rmse_m"],
-        "true_param_variance_rmse_p": result_sv["true_param_variance_rmse_p"],
-        "true_param_variance_rmse_m": result_sv["true_param_variance_rmse_m"],
-        "mean_ess":                  result_sv["mean_ess"],
-    }
-    print(json.dumps(summary_sv, indent=2, sort_keys=True))
+    # print("\n=== Semivariance Heston (two correlated CIR processes) ===")
+    # result_sv = run_semivariance_heston(
+    #     plot_path="semivariance_heston_diagnostic_plot.png"
+    # )
+    # summary_sv = {
+    #     "true_params":               result_sv["true_params"],
+    #     "fitted_params":             result_sv["fitted_params"],
+    #     "true_param_loglik":         result_sv["true_param_loglik"],
+    #     "best_loglik":               result_sv["best_loglik"],
+    #     "bic":                       result_sv["bic"],
+    #     "variance_rmse_p":           result_sv["variance_rmse_p"],
+    #     "variance_rmse_m":           result_sv["variance_rmse_m"],
+    #     "true_param_variance_rmse_p": result_sv["true_param_variance_rmse_p"],
+    #     "true_param_variance_rmse_m": result_sv["true_param_variance_rmse_m"],
+    #     "mean_ess":                  result_sv["mean_ess"],
+    # }
+    # print(json.dumps(summary_sv, indent=2, sort_keys=True))
 
 
 
