@@ -1,20 +1,20 @@
-"""Stochastic Volatility Model with Log-Variance OU Process and Correlated Gaussian Jumps.
+"""Stochastic Volatility Model with CIR Variance Process and Correlated Gaussian Jumps.
 
 Design document: docs/svlogv_jump_apf_design.md
 
 Model
 -----
-Latent state: ell_t = log(V_t), driven by an OU process with additive Gaussian jumps.
+Latent state: V_t (variance), driven by a CIR process with additive Gaussian jumps.
 Observation:  y_t = log(S_t / S_{t-1}), driven by V_t (the *current* variance).
 
 Discretised SDEs (Euler-Maruyama):
 
-    y_t   = (r - 0.5*V_t)*dt - c_t + sqrt(V_t*dt)*epsilon_t + I_t*J_t^S
-    ell_t = ell_{t-1} + kappa*(theta - ell_{t-1})*dt
-              + sigma_v*sqrt(dt)*eta_t + I_t*J_t^V
+    y_t = (r - 0.5*V_t)*dt - c_t + sqrt(V_t*dt)*epsilon_t + I_t*J_t^S
+    V_t = V_{t-1} + kappa*(theta - V_{t-1})*dt
+            + sigma_v*sqrt(V_{t-1}*dt)*eta_t + I_t*J_t^V
 
 where:
-    V_t         = exp(ell_t)                  current variance (computed first)
+    V_t >= VARIANCE_FLOOR                     (clipped to stay positive)
     epsilon_t   = z1_t                        standard normal
     eta_t       = rho*z1_t + sqrt(1-rho^2)*z2_t
     I_t         ~ Bernoulli(lambda_J * dt_t)  shared jump indicator
@@ -28,8 +28,7 @@ Note: diffusive terms use dt = _DT_MIN (1 min); jump arrival uses dt_t.
 Inference: Auxiliary Particle Filter (APF) with Rao-Blackwellised pilot stage.
 
   Pilot stage:
-    hat_lnv^(i) = ell_{t-1}^(i) + kappa*(theta - ell_{t-1}^(i))*dt
-    hat_V^(i)   = exp(hat_lnv^(i))   (Jensen approximation for E[V_t | ell_{t-1}])
+    hat_V^(i) = max(V_{t-1}^(i) + kappa*(theta - V_{t-1}^(i))*dt, VARIANCE_FLOOR)
     mu_y^(i)    = (r - 0.5*hat_V^(i))*dt - c_t
     g_t^(i)     = (1-p_t)*N(y_t; mu_y^(i), hat_V^(i)*dt)
                  +   p_t *N(y_t; mu_y^(i)+mu_JS, hat_V^(i)*dt + sigma_JS^2)
@@ -38,7 +37,7 @@ Inference: Auxiliary Particle Filter (APF) with Rao-Blackwellised pilot stage.
     1. Compute posterior jump probability pi^(j) from Bayes on I_t.
     2. Sample b^(j) ~ Bernoulli(pi^(j)) via pre-drawn u_mix.
     3. Sample J_t^V ~ N(mu_JV, sigma_JV^2) from marginal prior.
-    4. Advance ell_t with OU diffusion + b^(j)*J_t^V.
+    4. Advance V_t with CIR diffusion + b^(j)*J_t^V, clip to VARIANCE_FLOOR.
 
   Correction weights (Rao-Blackwellised over J^S | J^V, b):
     J^S | J^V ~ N(mu_JS|V, sigma2_JS|V)
@@ -58,10 +57,10 @@ CRN noise layout: (T, 3*N + 2)
     cols  2N+2 .. 3N+1 U[0,1)  u_mix    per-particle Bernoulli threshold
 
 Parameters (12-dimensional):
-    x[0]  lnv0      initial log-variance
-    x[1]  kappa     OU mean-reversion speed (yr^-1)
-    x[2]  theta     OU long-run log-variance level
-    x[3]  sigma_v   OU vol-of-log-variance (yr^-0.5)
+    x[0]  v0        initial variance
+    x[1]  kappa     CIR mean-reversion speed (yr^-1)
+    x[2]  theta     CIR long-run variance level
+    x[3]  sigma_v   CIR vol-of-variance coefficient (yr^-0.5)
     x[4]  rho       diffusion correlation
     x[5]  r         risk-free rate (yr^-1)
     x[6]  lambda_J  jump intensity (jumps yr^-1)
@@ -91,27 +90,27 @@ from helper import (
 
 
 class StochasticVolatilityJumpProcess(StochasticProcessBase):
-    """Log-variance OU model with correlated bivariate Gaussian jumps.
+    """CIR variance model with correlated bivariate Gaussian jumps.
 
     See docs/svlogv_jump_apf_design.md for full mathematical derivation.
     """
 
     PARAM_NAMES = [
-        "lnv0", "kappa", "theta", "sigma_v", "rho", "r",
+        "v0", "kappa", "theta", "sigma_v", "rho", "r",
         "lambda_J", "mu_JS", "sigma_JS", "mu_JV", "sigma_JV", "rho_J",
     ]
     PARAM_TRANSFORMS = {
-        "lnv0":     ("sigmoid_ab", -10.0,  0.0),
+        "v0":       ("sigmoid_ab",  1e-4,  1.0),
         "kappa":    ("softplus",    0.01,  30.0),
-        "theta":    ("sigmoid_ab", -10.0,  0.0),
-        "sigma_v":  ("softplus",    0.01,   3.0),
+        "theta":    ("sigmoid_ab",  1e-4,  1.0),
+        "sigma_v":  ("softplus",    0.01,  30.0),
         "rho":      ("tanh",       -0.99,  0.99),
         "r":        ("sigmoid_ab", -1e-4,  1e-4),
-        "lambda_J": ("softplus",    0.1,  100.0),
+        "lambda_J": ("softplus",    0.1,  200.0),
         "mu_JS":    ("sigmoid_ab", -0.2,   0.2),
         "sigma_JS": ("softplus",    1e-3,  0.3),
         "mu_JV":    ("sigmoid_ab", -0.3,   0.3),
-        "sigma_JV": ("softplus",    1e-3,  0.3),
+        "sigma_JV": ("softplus",    1e-3,  5.0),
         "rho_J":    ("tanh",       -0.99,  0.99),
     }
 
@@ -137,7 +136,7 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
         dt = jnp.float32(_DT_MIN)
 
         # ── Unpack constrained parameters ──────────────────────────────
-        lnv0      = x[:, 0]
+        v0        = x[:, 0]
         kappa     = x[:, 1]
         theta     = x[:, 2]
         sigma_v   = x[:, 3]
@@ -172,7 +171,7 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
         dt_seq      = dsetting.dt_seq                                        # (T,)
         noises_seq  = dsetting.noises                                        # (T, 4N+1)
 
-        particles    = jnp.repeat(lnv0, N)               # (P*N,)
+        particles    = jnp.repeat(v0, N)               # (P*N,)
         total_loglik = jnp.zeros((P,), dtype=jnp.float32)
         log_N        = jnp.log(jnp.float32(N))
 
@@ -188,16 +187,15 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
             u_mix_t  = noises_t[2 * N + 2: 3 * N + 2]   # (N,)
 
             # ── Per-step jump probability and compensator ────────────────
-            p_J_pn      = jnp.minimum(1.0, lambda_J_pn * dt_t)
+            p_J_pn      = 1.0 - jnp.exp(-lambda_J_pn * dt_t)
             comp_pn     = jnp.log(jnp.maximum(1.0 - p_J_pn + p_J_pn * m_r_pn, EPS))
             log_pJ_pn   = jnp.log(jnp.maximum(p_J_pn,       EPS))
             log_1mpJ_pn = jnp.log(jnp.maximum(1.0 - p_J_pn, EPS))
 
             # ── Pilot: RB marginal likelihood g_t^(i) ───────────────────
-            def _pilot_one(lnv, r, mu_js, sigma_js, comp_v, log_pj, log_1mpj, k, th):
-                hat_lnv = lnv + k * (th - lnv) * dt
-                hat_V   = jnp.maximum(jnp.exp(hat_lnv), VARIANCE_FLOOR)
-                mu_y    = (r - 0.5 * hat_V) * dt - comp_v
+            def _pilot_one(v, r, mu_js, sigma_js, comp_v, log_pj, log_1mpj, k, th):
+                hat_V = jnp.maximum(v + k * (th - v) * dt, VARIANCE_FLOOR)
+                mu_y    = r * dt # (r - 0.5 * hat_V) * dt - comp_v
                 sig2_0  = hat_V * dt
                 log_f0  = _gaussian_logpdf(obs, mu_y,         sig2_0)
                 sig2_1  = sig2_0 + sigma_js ** 2
@@ -222,7 +220,7 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
             )(log_g)                                                    # (P, N)
 
             particles_2d = particles_pn.reshape(P, N)
-            lnv_anc      = jax.vmap(lambda p, a: p[a])(particles_2d, ancestors)  # (P, N)
+            v_anc        = jax.vmap(lambda p, a: p[a])(particles_2d, ancestors)  # (P, N)
 
             # Gather pilot log-densities at ancestor indices.
             log_f0_sel = jax.vmap(lambda lf, a: lf[a])(
@@ -237,10 +235,10 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
             z_jv_pn  = jnp.tile(z_jv_t,  P)   # (P*N,)
             u_mix_pn = jnp.tile(u_mix_t,  P)   # (P*N,)
 
-            # ── Propagation: sample I_t, J_t^V, advance ell_t ───────────
+            # ── Propagation: sample I_t, J_t^V, advance V_t ─────────────
             # J_S is not sampled here; it will be Rao-Blackwellised out in
             # the correction weight via J_S | J_V ~ N(mu_JS|V, sigma2_JS|V).
-            def _propagate_one(lnv, log_pj, log_1mpj, log_f0_, log_f1_,
+            def _propagate_one(v, log_pj, log_1mpj, log_f0_, log_f1_,
                                sv, k, th, mu_jv, sigma_jv,
                                z_eta, z_jv, u_mix):
                 # Posterior jump probability via Bayes
@@ -248,11 +246,14 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
                 pi       = jax.nn.sigmoid(logit_pi)
                 b   = (u_mix < pi).astype(jnp.float32)
                 J_V = mu_jv + sigma_jv * z_jv
-                lnv_new = (lnv + k * (th - lnv) * dt + sv * jnp.sqrt(dt) * z_eta + b * J_V)
-                return jnp.clip(lnv_new, -20.0, 5.0), b, J_V
+                v_eff = jnp.maximum(v, VARIANCE_FLOOR)
+                v_new = (v + k * (th - v) * dt
+                         + sv * jnp.sqrt(v_eff * dt) * z_eta
+                         + b * J_V)
+                return jnp.clip(v_new, VARIANCE_FLOOR, 5.0), b, J_V
 
-            lnv_new_pn, b_pn, J_V_pn = jax.vmap(_propagate_one)(
-                lnv_anc.reshape(PN),
+            v_new_pn, b_pn, J_V_pn = jax.vmap(_propagate_one)(
+                v_anc.reshape(PN),
                 log_pJ_pn, log_1mpJ_pn,
                 log_f0_sel.reshape(PN), log_f1_sel.reshape(PN),
                 sigma_v_pn, kappa_pn, theta_pn,
@@ -268,16 +269,17 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
             # Conditioning on (z_eta, b, J_V) gives a single Gaussian:
             #   mu_y  = (r - 0.5V)*dt - c_t + sqrt(V*dt)*rho*z_eta + b * mu_JS|V
             #   sig2  = V*dt*(1 - rho^2) + b * sigma2_JS|V
-            def _obs_loglik_one(lnv, r, comp_v, rho, z_eta, b, J_V, mu_js, sigma_js, mu_jv, sigma_jv, rho_j):
-                V_eff            = jnp.maximum(jnp.exp(lnv), VARIANCE_FLOOR)
+            def _obs_loglik_one(v, r, comp_v, rho, z_eta, b, J_V, mu_js, sigma_js, mu_jv, sigma_jv, rho_j):
+                V_eff            = jnp.maximum(v, VARIANCE_FLOOR)
                 mu_JS_given_JV   = mu_js + (sigma_js * rho_j / sigma_jv) * (J_V - mu_jv)
                 sig2_JS_given_JV = sigma_js ** 2 * (1.0 - rho_j ** 2)
-                mu_y = (r - 0.5 * V_eff) * dt - comp_v + jnp.sqrt(V_eff * dt) * rho * z_eta + b * mu_JS_given_JV
+                mu_y = r * dt + jnp.sqrt(V_eff * dt) * rho * z_eta + b * mu_JS_given_JV
+                #  mu_y = (r - 0.5 * V_eff) * dt - comp_v + jnp.sqrt(V_eff * dt) * rho * z_eta + b * mu_JS_given_JV
                 sig2 = V_eff * dt * (1.0 - rho ** 2) + b * sig2_JS_given_JV
                 return _gaussian_logpdf(obs, mu_y, sig2)
 
             log_py_pn = jax.vmap(_obs_loglik_one)(
-                lnv_new_pn, r_pn, comp_pn, rho_pn,
+                v_new_pn, r_pn, comp_pn, rho_pn,
                 z_eta_pn, b_pn, J_V_pn,
                 mu_JS_pn, sigma_JS_pn, mu_JV_pn, sigma_JV_pn, rho_J_pn,
             )   # (P*N,)
@@ -288,12 +290,12 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
             ancestors_w = jax.vmap(
                 lambda w: _systematic_resample(w, u_res2_t)
             )(log_w)                                                   # (P, N)
-            lnv_final   = jax.vmap(lambda p, a: p[a])(
-                lnv_new_pn.reshape(P, N), ancestors_w
+            v_final   = jax.vmap(lambda p, a: p[a])(
+                v_new_pn.reshape(P, N), ancestors_w
             )                                                          # (P, N)
 
             # ── Diagnostics ──────────────────────────────────────────────
-            V_final   = jnp.exp(lnv_final)
+            V_final   = v_final
             filt_mean = jnp.mean(V_final,  axis=-1)                   # (P,)
             filt_std  = jnp.sqrt(
                 jnp.mean((V_final - filt_mean[:, None]) ** 2, axis=-1)
@@ -304,8 +306,8 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
             )   # (P,)
 
             # ── One-step-ahead predictive moments ────────────────────────
-            def _pred_one(lnv, r, p_j, mu_js, sigma_js, comp_v):
-                V_eff = jnp.maximum(jnp.exp(lnv), VARIANCE_FLOOR)
+            def _pred_one(v, r, p_j, mu_js, sigma_js, comp_v):
+                V_eff = jnp.maximum(v, VARIANCE_FLOOR)
                 mu_y  = (r - 0.5 * V_eff) * dt - comp_v + p_j * mu_js
                 var_y = (
                     V_eff * dt
@@ -315,7 +317,7 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
                 return mu_y, var_y
 
             pred_mu_pn, pred_var_pn = jax.vmap(_pred_one)(
-                lnv_final.reshape(PN), r_pn, p_J_pn,
+                v_final.reshape(PN), r_pn, p_J_pn,
                 mu_JS_pn, sigma_JS_pn, comp_pn,
             )
             pred_lr_mean = jnp.mean(pred_mu_pn)
@@ -324,7 +326,7 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
                 + jnp.mean((pred_mu_pn - pred_lr_mean) ** 2)
             )
 
-            new_carry = (lnv_final.reshape(PN), total_loglik)
+            new_carry = (v_final.reshape(PN), total_loglik)
             return new_carry, (
                 filt_mean.mean(), filt_std.mean(), ess_val.mean(),
                 log_Z.mean(), pred_lr_mean, pred_lr_std,
@@ -375,17 +377,17 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
     def get_default_param(self, key: chex.PRNGKey):
         import math
         initial_guess = {
-            "lnv0":     math.log(0.06),
+            "v0":       0.06,
             "kappa":    2.0,
-            "theta":    math.log(0.04),
+            "theta":    0.04,
             "sigma_v":  0.5,
             "rho":      -0.5,
             "r":        0.0,
-            "lambda_J": 50.0,
+            "lambda_J": 100.0,
             "mu_JS":    0,
             "sigma_JS": 0.05,
             "mu_JV":    0,
-            "sigma_JV": 0.05,
+            "sigma_JV": 0.1,
             "rho_J":    -0.3,
         }
         num_dims = len(initial_guess)
@@ -426,17 +428,17 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
         num_days: int,
         params: np.ndarray,
     ):
-        """Generate a synthetic price path and log-variance path.
+        """Generate a synthetic price path and variance path.
 
-        Discretisation order per step (ell_t computed before y_t so that
-        y_t uses the *current* variance V_t = exp(ell_t)):
+        Discretisation order per step (V_t computed before y_t so that
+        y_t uses the *current* variance V_t):
 
             1. Sample z1, z2, z_j1, z_j2 ~ N(0,1) and u ~ U[0,1).
-            2. Advance log-variance:
-               ell_t = ell_{t-1} + kappa*(theta-ell_{t-1})*dt_min
-                       + sigma_v*sqrt(dt_min)*eta + I_t*J_t^V
-            3. Compute V_t = exp(ell_t).
-            4. Compute risk-neutral log-return:
+            2. Advance variance (CIR):
+               V_t = max(V_{t-1} + kappa*(theta-V_{t-1})*dt_min
+                         + sigma_v*sqrt(V_{t-1}*dt_min)*eta + I_t*J_t^V,
+                         VARIANCE_FLOOR)
+            3. Compute risk-neutral log-return:
                y_t = (r - 0.5*V_t)*dt_min - c_t + sqrt(V_t*dt_min)*z1 + I_t*J_t^S
 
         Args:
@@ -446,7 +448,7 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
             params:    Shape-(12,) array in PARAM_NAMES order.
 
         Returns:
-            Tuple (log_returns, log_variances), each shape (390*num_days,),
+            Tuple (log_returns, variances), each shape (390*num_days,),
             dtype float32.
         """
         if num_days < 1:
@@ -457,7 +459,7 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
         if params.shape != (12,):
             raise ValueError("params must have shape (12,)")
 
-        (lnv0, kappa, theta, sigma_v, rho, r,
+        (v0, kappa, theta, sigma_v, rho, r,
          lambda_J, mu_JS, sigma_JS, mu_JV, sigma_JV, rho_J) = params
 
         sqrt_1m_rho2  = np.sqrt(max(1.0 - rho   ** 2, 1e-8))
@@ -468,9 +470,9 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
         dt_arr = make_dt_seq(num_days)
         length = len(dt_arr)
 
-        log_variances = np.zeros(length, dtype=np.float64)
-        log_returns   = np.zeros(length, dtype=np.float64)
-        lnv_prev      = float(lnv0)
+        variances   = np.zeros(length, dtype=np.float64)
+        log_returns = np.zeros(length, dtype=np.float64)
+        v_prev      = float(v0)
         print(f"dt Min: {dt_arr.min()} Max: {dt_arr.max()}")
         p_J_min = lambda_J * dt_arr.min()
         p_J_max = lambda_J * dt_arr.max()
@@ -478,7 +480,7 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
 
         for step in range(length):
             dt_t = float(dt_arr[step])
-            p_J  = np.minimum(1.0, lambda_J * dt_t)
+            p_J  = 1.0 - np.exp(-lambda_J * dt_t)
             comp = np.log(max((1.0 - p_J) + p_J * m_r, 1e-30))
 
             z1   = rng.normal()
@@ -492,28 +494,28 @@ class StochasticVolatilityJumpProcess(StochasticProcessBase):
             J_S = mu_JS + sigma_JS * z_j1
             J_V = mu_JV + sigma_JV * (rho_J * z_j1 + sqrt_1m_rhoJ2 * z_j2)
 
-            # Step 1: advance log-variance (ell_t first)
-            lnv_t = (
-                lnv_prev
-                + kappa * (theta - lnv_prev) * _DT_MIN
-                + sigma_v * np.sqrt(_DT_MIN) * eta
+            # Step 1: advance variance (CIR with floor)
+            v_t = (
+                v_prev
+                + kappa * (theta - v_prev) * _DT_MIN
+                + sigma_v * np.sqrt(max(v_prev, VARIANCE_FLOOR) * _DT_MIN) * eta
                 + I_t * J_V
             )
-            V_t = max(np.exp(lnv_t), VARIANCE_FLOOR)
+            V_t = max(v_t, VARIANCE_FLOOR)
 
             # Step 2: log-return using current V_t
             y_t = (
-                (r - 0.5 * V_t) * _DT_MIN
-                - comp
+                # (r - 0.5 * V_t) * _DT_MIN - comp
+                r * _DT_MIN
                 + np.sqrt(V_t * _DT_MIN) * z1
                 + I_t * J_S
             )
 
-            log_variances[step] = lnv_t
-            log_returns[step]   = y_t
-            lnv_prev = lnv_t
+            variances[step]   = V_t
+            log_returns[step] = y_t
+            v_prev = V_t
 
         return (
             log_returns.astype(np.float32),
-            log_variances.astype(np.float32),
+            variances.astype(np.float32),
         )

@@ -32,7 +32,7 @@ PARAM_NAMES_JUMP = (
     "p_J", "mu_Jr", "sigma_Jr", "mu_JV", "sigma_JV", "rho_J",
 )
 PARAM_NAMES_SVJ = (
-    "lnv0", "kappa", "theta", "sigma_v", "rho", "r",
+    "v0", "kappa", "theta", "sigma_v", "rho", "r",
     "lambda_J", "mu_JS", "sigma_JS", "mu_JV", "sigma_JV", "rho_J",
 )
 
@@ -1389,9 +1389,9 @@ def run_svlogv_jump(
     if true_params is None:
         true_params = np.array(
             [
-                math.log(0.20),  # lnv0  — log(20% annualised vol squared)
+                0.20,  # v0  — 20% annualised vol squared
                 4.0,             # kappa — OU mean-reversion speed
-                math.log(0.08),  # theta — long-run log-variance
+                0.08,  # theta — long-run variance
                 1.2,             # sigma_v
                -0.7,             # rho
                 0.0,             # r
@@ -1407,13 +1407,12 @@ def run_svlogv_jump(
     else:
         true_params = np.asarray(true_params, dtype=np.float32)
     # jax.config.update("jax_disable_jit", True)
-    log_returns, true_log_variance = StochasticVolatilityJumpProcess.generator(
+    log_returns, true_variance = StochasticVolatilityJumpProcess.generator(
         seed=seed,
         S0=S0,
         num_days=num_days,
         params=true_params,
     )
-    true_variance = np.exp(true_log_variance)   # back to variance units for plotting
     prices = _prices_from_log_returns(S0, log_returns)
 
     if plot_path is not None:
@@ -1474,7 +1473,6 @@ def run_svlogv_jump(
         "prices":            prices,
         "log_returns":       log_returns,
         "true_variance":     true_variance,
-        "true_log_variance": true_log_variance,
         "filtered_variance": filtered_variance,
         "filtered_std":      filtered_std,
         "ess":               ess,
@@ -1506,6 +1504,173 @@ def run_svlogv_jump(
     return result
 
 
+def run_real_svlogv_jump(
+    root: str,
+    num_steps: int = 20000,
+    seed: int = 0,
+    popsize: int = 256,
+    num_generations: int = 100,
+    sigma_init: float = 0.8,
+    num_particles: int = 4096,
+    plot_path: str | Path | None = None,
+    db_name: str = "stock",
+    db_username: str = "metis",
+    db_password: str = "123456",
+) -> dict[str, object]:
+    """Calibrate StochasticVolatilityJumpProcess on real 1-min OHLCV data.
+
+    Loads ``num_steps + 1`` rows (RTH 1-min bars) for ``root`` from MySQL,
+    preprocesses the close-to-close log-return series and dt sequence,
+    then runs CMA-ES calibration followed by an RB-APF filter pass.
+    The EWA of close-to-close squared returns is computed as a variance
+    proxy for plotting only; it is not used in the likelihood.
+
+    Args:
+        root:            Ticker symbol (e.g. ``"SPY"``).
+        num_steps:       Number of log-return steps to use (default 20 000).
+                         ``num_steps + 1`` rows are loaded from the database.
+        seed:            JAX PRNG seed for noise pre-generation.
+        popsize:         CMA-ES population size.
+        num_generations: CMA-ES iteration budget.
+        sigma_init:      CMA-ES initial step-size.
+        num_particles:   RB-APF particle count.
+        plot_path:       If given, saves a Plotly diagnostic HTML/PNG at this path.
+        db_name:         MySQL database name.
+        db_username:     MySQL username.
+        db_password:     MySQL password.
+
+    Returns:
+        Dictionary with keys: root, S, opens, highs, lows, closes,
+        ewa_c2c_variance, dt_seq, log_returns,
+        filtered_variance, filtered_std, ess, loglik_increments,
+        fitted_params, best_loglik, bic, mean_ess, [plot_path].
+    """
+    import sys
+    import os
+    import pandas as pd
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "data"))
+    from data.database import Database
+
+    # ── Load data ──────────────────────────────────────────────────────
+    db = Database(db_name=db_name, db_username=db_username, db_password=db_password)
+    df = db.load(root=root, start_date=20230101, end_date=21001231)
+    if df is None or len(df) == 0:
+        raise ValueError(f"No data found for root='{root}'")
+
+    df = df.sort_values("date").reset_index(drop=True)
+    need = num_steps + 1
+    if len(df) < need:
+        raise ValueError(
+            f"Only {len(df)} rows available for root='{root}', need {need}"
+        )
+    df = df.iloc[-need:].reset_index(drop=True)   # shape (T+1, ...)
+
+    T = num_steps
+
+    # ── Price series S ─────────────────────────────────────────────────
+    # S[i] = close of bar i; log_return[i] = log(S[i+1] / S[i])
+    S = df["close"].values.astype(np.float32)    # (T+1,)
+
+    # ── dt sequence ────────────────────────────────────────────────────
+    # Transition i → i+1: overnight if the two bars fall on different
+    # calendar days, otherwise one intraday minute.
+    dates   = pd.to_datetime(df["date"])
+    day_arr = dates.dt.date.values
+    is_overnight = (day_arr[1:] != day_arr[:-1])  # (T,) bool
+    dt_seq = np.where(is_overnight, _DT_OVERNIGHT, _DT_MIN).astype(np.float32)  # (T,)
+
+    # ── OHLC price arrays for the candlestick panel ────────────────────
+    opens  = df["open"].values[1:].astype(np.float32)
+    highs  = df["high"].values[1:].astype(np.float32)
+    lows   = df["low"].values[1:].astype(np.float32)
+    closes = df["close"].values[1:].astype(np.float32)   # == S[1:]
+
+    log_returns = np.log(S[1:] / S[:-1]).astype(np.float32)  # (T,)
+
+    # ── EWA close-to-close variance proxy (for plotting only) ──────────
+    # Annualised per-step variance: c2c_raw[t] = r[t]² / dt[t]
+    # Smoothed with an exponential moving average (half-life = 30 steps).
+    _ewa_alpha = 1.0 - np.exp(-np.log(2.0) / 30.0)
+    c2c_raw = (log_returns.astype(np.float64) ** 2 / dt_seq.astype(np.float64)).astype(np.float32)
+    ewa_c2c_variance = np.empty_like(c2c_raw)
+    ewa_c2c_variance[0] = c2c_raw[0]
+    for i in range(1, len(c2c_raw)):
+        ewa_c2c_variance[i] = (
+            _ewa_alpha * c2c_raw[i] + (1.0 - _ewa_alpha) * ewa_c2c_variance[i - 1]
+        )
+
+    # ── Build process and override dt_seq ─────────────────────────────
+    process = StochasticVolatilityJumpProcess(
+        popsize=popsize,
+        num_generations=num_generations,
+        sigma_init=sigma_init,
+        dt=float(_DT_MIN),
+        num_particles=num_particles,
+        S=S,
+        rho_cpm=0.5,
+    )
+    setting, dsetting = process.get_default_param(jax.random.PRNGKey(seed))
+    # Replace the synthetic dt_seq with the real one.
+    dsetting = dsetting.replace(dt_seq=jnp.array(dt_seq, dtype=jnp.float32))
+
+    # ── CMA-ES calibration ─────────────────────────────────────────────
+    fit_key = jax.random.PRNGKey(seed + 1)
+    best_member, bic = process.calibrate(fit_key, setting, dsetting)
+    fitted_params = np.asarray(
+        jax.device_get(process.unconstrained_to_params(best_member)),
+        dtype=np.float32,
+    )
+
+    # ── RB-APF filter pass with fitted parameters ──────────────────────
+    filter_carry, filter_info = process.loglikelihood(
+        jnp.asarray(fitted_params, dtype=jnp.float32)[None, :],
+        setting,
+        dsetting,
+    )
+
+    filtered_variance  = np.asarray(jax.device_get(filter_info.filtered_mean),     dtype=np.float32)
+    filtered_std       = np.asarray(jax.device_get(filter_info.filtered_std),      dtype=np.float32)
+    ess                = np.asarray(jax.device_get(filter_info.ess),               dtype=np.float32)
+    loglik_increments  = np.asarray(jax.device_get(filter_info.loglik_increments), dtype=np.float32)
+    total_loglik       = float(jax.device_get(filter_carry[-1][0]))
+    bic                = float(jax.device_get(bic))
+
+    result: dict[str, object] = {
+        "root":               root,
+        "S":                  S,
+        "opens":              opens,
+        "highs":              highs,
+        "lows":               lows,
+        "closes":             closes,
+        "log_returns":        log_returns,
+        "ewa_c2c_variance":   ewa_c2c_variance,
+        "dt_seq":             dt_seq,
+        "filtered_variance":  filtered_variance,
+        "filtered_std":       filtered_std,
+        "ess":                ess,
+        "loglik_increments":  loglik_increments,
+        "fitted_params":      _to_svj_param_dict(fitted_params),
+        "best_loglik":        total_loglik,
+        "bic":                bic,
+        "mean_ess":           float(np.mean(ess)),
+    }
+
+    if plot_path is not None:
+        result["plot_path"] = _save_inhomo_diagnostic_plot(
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            log_returns=log_returns,
+            true_variance=ewa_c2c_variance,
+            filtered_variance=filtered_variance,
+            filtered_std=filtered_std,
+            plot_path=plot_path,
+        )
+
+    return result
+
+
 def main() -> None:
 
 
@@ -1525,33 +1690,30 @@ def main() -> None:
     # run_real_inhomo_heston(
     #     root="QQQ",plot_path="real_inhomo_heston_diagnostic_plot.png")
 
+
+    # print("\n=== SVLogV-Jump model (RB-APF) ===")
+    # result_svj = run_svlogv_jump(plot_path="svlogv_jump_diagnostic_plot.png")
+    # summary_svj = {
+    #     "true_params":              result_svj["true_params"],
+    #     "fitted_params":            result_svj["fitted_params"],
+    #     "true_param_loglik":        result_svj["true_param_loglik"],
+    #     "best_loglik":              result_svj["best_loglik"],
+    #     "bic":                      result_svj["bic"],
+    #     "variance_rmse":            result_svj["variance_rmse"],
+    #     "true_param_variance_rmse": result_svj["true_param_variance_rmse"],
+    #     "mean_ess":                 result_svj["mean_ess"],
+    # }
+    # print(json.dumps(summary_svj, indent=2, sort_keys=True))
+
     print("\n=== SVLogV-Jump model (RB-APF) ===")
-    result_svj = run_svlogv_jump(plot_path="svlogv_jump_diagnostic_plot.png")
+    result_svj = run_real_svlogv_jump(root="QQQ", plot_path="real_svlogv_jump_diagnostic_plot.png")
     summary_svj = {
-        "true_params":              result_svj["true_params"],
         "fitted_params":            result_svj["fitted_params"],
-        "true_param_loglik":        result_svj["true_param_loglik"],
         "best_loglik":              result_svj["best_loglik"],
         "bic":                      result_svj["bic"],
-        "variance_rmse":            result_svj["variance_rmse"],
-        "true_param_variance_rmse": result_svj["true_param_variance_rmse"],
         "mean_ess":                 result_svj["mean_ess"],
     }
     print(json.dumps(summary_svj, indent=2, sort_keys=True))
-
-    # print("\n=== Quadratic Rough Heston+ (QRH+) ===")
-    # result_qrh = run_qrh(plot_path="qrh_diagnostic_plot.png")
-    # summary_qrh = {
-    #     "true_params":              result_qrh["true_params"],
-    #     "fitted_params":            result_qrh["fitted_params"],
-    #     "true_param_loglik":        result_qrh["true_param_loglik"],
-    #     "best_loglik":              result_qrh["best_loglik"],
-    #     "bic":                      result_qrh["bic"],
-    #     "variance_rmse":            result_qrh["variance_rmse"],
-    #     "true_param_variance_rmse": result_qrh["true_param_variance_rmse"],
-    #     "mean_ess":                 result_qrh["mean_ess"],
-    # }
-    # print(json.dumps(summary_qrh, indent=2, sort_keys=True))
 
     # print("\n=== Semivariance Heston (two correlated CIR processes) ===")
     # result_sv = run_semivariance_heston(
