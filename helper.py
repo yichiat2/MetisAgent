@@ -25,6 +25,32 @@ class FilterInfo(NamedTuple):
     pred_log_return_std: chex.Array
 
 
+class SVJFilterInfo(NamedTuple):
+    """FilterInfo variant for StochasticVolatilityJumpProcess.
+
+    Uses per-step variance quantiles instead of std, and adds jump_prob.
+    """
+    filtered_mean: chex.Array          # (T,) particle mean of V
+    filtered_q05:  chex.Array          # (T,) 5th-percentile of V
+    filtered_q25:  chex.Array          # (T,) 25th-percentile of V
+    filtered_q50:  chex.Array          # (T,) 50th-percentile (median) of V
+    filtered_q75:  chex.Array          # (T,) 75th-percentile of V
+    filtered_q95:  chex.Array          # (T,) 95th-percentile of V
+    ess:                  chex.Array   # (T,) effective sample size
+    loglik_increments:    chex.Array   # (T,) per-step log-likelihood
+    pred_log_return_mean: chex.Array   # (T,) one-step-ahead predicted log-return mean
+    pred_log_return_std:  chex.Array   # (T,) one-step-ahead predicted log-return std
+    pred_log_return_skew: chex.Array   # (T,) one-step-ahead predicted log-return skewness
+    pred_log_return_kurt: chex.Array   # (T,) one-step-ahead predicted log-return excess kurtosis
+    pred_var_mean:        chex.Array   # (T,) one-step-ahead predicted variance mean
+    pred_var_q05:         chex.Array   # (T,) 5th-percentile of predicted variance
+    pred_var_q25:         chex.Array   # (T,) 25th-percentile of predicted variance
+    pred_var_q50:         chex.Array   # (T,) 50th-percentile of predicted variance
+    pred_var_q75:         chex.Array   # (T,) 75th-percentile of predicted variance
+    pred_var_q95:         chex.Array   # (T,) 95th-percentile of predicted variance
+    jump_prob:            chex.Array   # (T,) mean posterior jump probability
+
+
 def _positive_variance(variance: chex.Array) -> chex.Array:
     return jnp.maximum(variance, jnp.float32(VARIANCE_FLOOR))
 

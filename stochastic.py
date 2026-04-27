@@ -82,7 +82,8 @@ class StochasticProcessBase:
                  dt: float,
                  num_particles: int,
                  S: np.ndarray,
-                 rho_cpm: float):
+                 rho_cpm: float,
+                 dt_seq: np.ndarray | None = None):
         self.popsize = popsize
         self.num_generations = num_generations
         self.sigma_init = sigma_init
@@ -90,6 +91,7 @@ class StochasticProcessBase:
         self.num_particles = num_particles
         self.rho_cpm = rho_cpm
         self.S = jnp.array(S, dtype=jnp.float32)
+        self.dt_seq = np.asarray(dt_seq, dtype=np.float32) if dt_seq is not None else None
 
     def params_to_unconstrained(self, params: dict) -> jnp.ndarray:
         """Map constrained parameter dict → unconstrained vector."""
