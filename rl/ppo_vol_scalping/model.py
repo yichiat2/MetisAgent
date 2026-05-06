@@ -15,42 +15,37 @@ from .config import PPOVolScalpingConfig
 from .contracts import STATE_DIM
 
 
-def sample_and_log_prob(rng: jax.Array, mean: jnp.ndarray, log_std: jnp.ndarray, scale: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-    std = jnp.exp(log_std)
-    eps = jax.random.normal(rng, shape=mean.shape)
-    z = mean + std * eps
-    action = scale * jax.nn.sigmoid(z)
-    action = jnp.clip(action, 1e-5, scale - 1e-5)  
-    # log p(z) element-wise via reparameterisation
-    log_prob_z = -0.5 * eps ** 2 - log_std - 0.5 * jnp.log(2.0 * jnp.pi)
-    # For a = scale * sigmoid(z), log p(a) = log p(z) - log |da/dz|.
-    log_abs_det = jnp.log(scale) - jax.nn.softplus(-z) - jax.nn.softplus(z)
-    log_prob = jnp.sum(log_prob_z - log_abs_det, axis=-1)
+def sample_and_log_prob(
+    rng: jax.Array,
+    dist: distrax.Categorical,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    action = dist.sample(seed=rng)
+    log_prob = get_log_prob(dist, action)
     return action, log_prob
 
-def deterministic_action(mean: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
-    return jnp.clip(scale * jax.nn.sigmoid(mean), 1e-5, scale - 1e-5)
 
-def get_log_prob(mean: jnp.ndarray, log_std: jnp.ndarray, action: jnp.ndarray, scale: jnp.ndarray) -> jnp.ndarray:
-    action = jnp.clip(action, 1e-5, scale - 1e-5)
-    std = jnp.exp(log_std)
-    # Invert the transform: z = logit(action / scale)
-    u = action / scale
-    z = jnp.log(u) - jnp.log1p(-u)
-    log_prob_z = -0.5 * ((z - mean) / std) ** 2 - log_std - 0.5 * jnp.log(2.0 * jnp.pi)
-    log_abs_det = jnp.log(scale) - jax.nn.softplus(-z) - jax.nn.softplus(z)
-    return jnp.sum(log_prob_z - log_abs_det, axis=-1)
+def deterministic_action(dist: distrax.Categorical) -> jnp.ndarray:
+    return dist.mode()
 
-def get_entropy(log_std: jnp.ndarray) -> jnp.ndarray:
-    # Differential entropy of the base Normal: 0.5 * (1 + log(2*pi) + 2*log_std)
-    return jnp.sum(0.5 * (1.0 + jnp.log(2.0 * jnp.pi) + 2.0 * log_std), axis=-1)
+
+def get_log_prob(dist: distrax.Categorical, action: jnp.ndarray) -> jnp.ndarray:
+    action = jnp.asarray(action, dtype=jnp.int32)
+    log_prob = dist.log_prob(action)
+    log_prob = jnp.sum(log_prob, axis=-1)
+    return log_prob
+
+
+def get_entropy(dist: distrax.Categorical) -> jnp.ndarray:
+    entropy = dist.entropy()
+    entropy = jnp.sum(entropy, axis=-1)
+    return entropy
 
 
 class Actor(nn.Module):
     hidden_sizes: tuple[int, ...] = (64, 64)
-    log_std_min: float = -5.0
-    log_std_max: float = 2.0
-    action_dim: int = 3
+    action_dim: int = 2
+    action_cardinality: int = 4
+
     @nn.compact
     def __call__(self, state: jnp.ndarray) -> distrax.Distribution:
         activation = lambda x: nn.leaky_relu(x, negative_slope=0.01)
@@ -62,10 +57,14 @@ class Actor(nn.Module):
                 bias_init=constant(0.0),
             )(hidden)
             hidden = activation(hidden)
-        mean = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0),)(hidden)
-        raw_log_std = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0),)(hidden)
-        log_std = jnp.clip(raw_log_std, self.log_std_min, self.log_std_max)
-        return mean, log_std
+        logits = nn.Dense(
+            self.action_dim * self.action_cardinality,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0),
+        )(hidden)
+        logits = logits.reshape(logits.shape[:-1] + (self.action_dim, self.action_cardinality))
+        dist = distrax.Categorical(logits=logits)
+        return dist
 
 
 class Critic(nn.Module):
@@ -98,10 +97,8 @@ def create_train_states(
     dummy_state = jnp.zeros((STATE_DIM,), dtype=jnp.float32)
     actor = Actor(
         hidden_sizes=config.model.hidden_sizes,
-        log_std_min=config.model.log_std_min,
-        log_std_max=config.model.log_std_max,
         action_dim=config.model.action_dim,
-        action_scale=config.model.action_scale,
+        action_cardinality=config.model.action_cardinality,
     )
     critic = Critic(hidden_sizes=config.model.hidden_sizes)
 
@@ -131,4 +128,8 @@ __all__ = [
     "Actor",
     "Critic",
     "create_train_states",
+    "deterministic_action",
+    "get_entropy",
+    "get_log_prob",
+    "sample_and_log_prob",
 ]

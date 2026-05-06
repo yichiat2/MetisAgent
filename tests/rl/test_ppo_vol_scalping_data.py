@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 
 
 def _load_module(module_name: str, file_path: Path):
@@ -62,7 +63,6 @@ def _make_database_bars() -> pd.DataFrame:
 
 def _make_feature_config() -> SimpleNamespace:
     return SimpleNamespace(
-        variance_ema_length=3,
         fast_ema_length=2,
         slow_ema_length=4,
         atr_length=3,
@@ -116,7 +116,6 @@ def test_build_preprocessed_arrays_returns_expected_shapes_and_features(monkeypa
     assert preprocessed.ohlc.shape == (12, 4)
     assert preprocessed.static_features.shape == (12, 7)
     assert preprocessed.atr.shape == (12,)
-    assert preprocessed.sigma_price.shape == (12,)
     assert preprocessed.day_ids.shape == (12,)
     assert preprocessed.bar_in_day.shape == (12,)
     assert preprocessed.session_end_mask.shape == (12,)
@@ -124,7 +123,6 @@ def test_build_preprocessed_arrays_returns_expected_shapes_and_features(monkeypa
     assert preprocessed.ohlc.dtype == np.float32
     assert preprocessed.static_features.dtype == np.float32
     assert preprocessed.atr.dtype == np.float32
-    assert preprocessed.sigma_price.dtype == np.float32
     assert preprocessed.day_ids.dtype == np.int32
     assert preprocessed.bar_in_day.dtype == np.int32
     assert preprocessed.session_end_mask.dtype == np.bool_
@@ -135,6 +133,12 @@ def test_build_preprocessed_arrays_returns_expected_shapes_and_features(monkeypa
     )
     np.testing.assert_allclose(preprocessed.static_features[:, 0], loaded_bars["tau"].to_numpy(dtype=np.float32))
     np.testing.assert_allclose(preprocessed.static_features[:, 1], expected_log_returns, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        preprocessed.static_features[:, 2],
+        preprocessed.atr / loaded_bars["close"].to_numpy(dtype=np.float32) * np.float32(1000.0),
+        rtol=1e-6,
+        atol=1e-6,
+    )
     np.testing.assert_array_equal(preprocessed.day_ids, loaded_bars["day_id"].to_numpy(dtype=np.int32))
     np.testing.assert_array_equal(preprocessed.bar_in_day, loaded_bars["bar_in_day"].to_numpy(dtype=np.int32))
     np.testing.assert_array_equal(
@@ -144,7 +148,55 @@ def test_build_preprocessed_arrays_returns_expected_shapes_and_features(monkeypa
     assert np.isfinite(preprocessed.static_features).all()
     assert np.isfinite(preprocessed.ohlc).all()
     assert np.isfinite(preprocessed.atr).all()
-    assert np.isfinite(preprocessed.sigma_price).all()
+
+
+def test_build_preprocessed_arrays_is_prefix_causal(monkeypatch) -> None:
+    loaded_bars = _load_bars(monkeypatch)
+
+    baseline = data_module.build_preprocessed_arrays(loaded_bars, _make_feature_config())
+
+    mutated_bars = loaded_bars.copy()
+    mutated_bars.loc[6:, ["open", "high", "low", "close", "average_price"]] += 1_000.0
+
+    mutated = data_module.build_preprocessed_arrays(mutated_bars, _make_feature_config())
+
+    np.testing.assert_allclose(baseline.ohlc[:6], mutated.ohlc[:6], rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(
+        baseline.static_features[:6],
+        mutated.static_features[:6],
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(baseline.atr[:6], mutated.atr[:6], rtol=1e-6, atol=1e-6)
+    assert not np.allclose(baseline.static_features[6], mutated.static_features[6])
+
+
+def test_build_preprocessed_arrays_aligns_current_bar_outputs(monkeypatch) -> None:
+    loaded_bars = _load_bars(monkeypatch)
+    baseline = data_module.build_preprocessed_arrays(loaded_bars, _make_feature_config())
+
+    mutated_bars = loaded_bars.copy()
+    mutated_bars.loc[3, ["open", "high", "low", "close", "average_price"]] += np.array(
+        [10.0, 20.0, 30.0, 40.0, 40.0],
+        dtype=np.float64,
+    )
+    mutated = data_module.build_preprocessed_arrays(mutated_bars, _make_feature_config())
+
+    ohlc_changed_rows = np.flatnonzero(np.any(~np.isclose(baseline.ohlc, mutated.ohlc), axis=1))
+    atr_changed_rows = np.flatnonzero(~np.isclose(baseline.atr, mutated.atr))
+    feature_changed_rows = np.flatnonzero(
+        np.any(~np.isclose(baseline.static_features, mutated.static_features), axis=1)
+    )
+
+    np.testing.assert_array_equal(ohlc_changed_rows, np.array([3], dtype=np.int64))
+    np.testing.assert_array_equal(
+        atr_changed_rows,
+        np.arange(3, loaded_bars.shape[0], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(
+        feature_changed_rows,
+        np.arange(3, loaded_bars.shape[0], dtype=np.int64),
+    )
 
 
 def test_build_walk_forward_folds_creates_expected_windows(monkeypatch) -> None:
@@ -181,17 +233,16 @@ def test_build_walk_forward_folds_creates_expected_windows(monkeypatch) -> None:
     np.testing.assert_array_equal(second_fold.episode_start_indices, np.array([0, 2], dtype=np.int32))
 
 
-def test_build_walk_forward_folds_returns_empty_when_history_is_too_short(monkeypatch) -> None:
+def test_build_walk_forward_folds_raises_when_history_is_too_short(monkeypatch) -> None:
     loaded_bars = _load_bars(monkeypatch)
     preprocessed = data_module.build_preprocessed_arrays(loaded_bars, _make_feature_config())
 
-    folds = data_module.build_walk_forward_folds(
-        preprocessed_arrays=preprocessed,
-        train_window_bars=10,
-        inference_window_bars=4,
-        fold_stride_bars=1,
-        episode_length=3,
-        episode_stride=1,
-    )
-
-    assert folds == []
+    with pytest.raises(AssertionError, match="Not enough bars to create a single fold"):
+        data_module.build_walk_forward_folds(
+            preprocessed_arrays=preprocessed,
+            train_window_bars=10,
+            inference_window_bars=4,
+            fold_stride_bars=1,
+            episode_length=3,
+            episode_stride=1,
+        )

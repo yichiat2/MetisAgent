@@ -45,7 +45,7 @@ BAR_COLUMNS = (
 STATIC_FEATURE_NAMES = (
     "tau",
     "log_return",
-    "ema_variance",
+    "atr_over_close_milli",
     "srvi",
     "vslope",
     "vmacd",
@@ -61,7 +61,6 @@ class PreprocessedArrays:
     ohlc: Any
     static_features: Any
     atr: Any
-    sigma_price: Any
     day_ids: Any
     bar_in_day: Any
     session_end_mask: Any
@@ -75,7 +74,6 @@ class PreprocessedArrays:
             ohlc=self.ohlc[idx],
             static_features=self.static_features[idx],
             atr=self.atr[idx],
-            sigma_price=self.sigma_price[idx],
             day_ids=self.day_ids[idx],
             bar_in_day=self.bar_in_day[idx],
             session_end_mask=self.session_end_mask[idx],

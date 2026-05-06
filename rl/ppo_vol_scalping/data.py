@@ -80,7 +80,6 @@ def build_preprocessed_arrays(raw_bars_df: pd.DataFrame, feature_config: Feature
     log_return[1:] = np.log(close[1:] / prev_close[1:])
 
     variance_proxy = np.square(log_return)
-    ema_variance = _ema(variance_proxy, feature_config.variance_ema_length)
     ema_fast = _ema(close, feature_config.fast_ema_length)
     ema_slow = _ema(close, feature_config.slow_ema_length)
 
@@ -97,7 +96,7 @@ def build_preprocessed_arrays(raw_bars_df: pd.DataFrame, feature_config: Feature
     srvi_num = _rolling_sum(signed_variance, feature_config.srvi_length)
     srvi_den = _rolling_sum(variance_proxy, feature_config.srvi_length)
     srvi = srvi_num / np.maximum(srvi_den, feature_config.epsilon)
-    sigma_price = close * (np.exp(np.sqrt(np.maximum(ema_variance, 0.0) + feature_config.epsilon)) - 1.0)
+    atr_over_close_milli = atr / np.maximum(close, feature_config.epsilon) * 1000.0
 
     vslope = np.zeros_like(close)
     vslope[1:] = (ema_slow[1:] - ema_slow[:-1]) / (atr[1:] + feature_config.epsilon)
@@ -110,7 +109,7 @@ def build_preprocessed_arrays(raw_bars_df: pd.DataFrame, feature_config: Feature
         [
             raw_bars_df["tau"].to_numpy(dtype=np.float64),
             log_return,
-            ema_variance,
+            atr_over_close_milli,
             srvi,
             vslope,
             vmacd,
@@ -123,7 +122,6 @@ def build_preprocessed_arrays(raw_bars_df: pd.DataFrame, feature_config: Feature
     static_features = np.ascontiguousarray(static_features.astype(np.float32))
     ohlc = np.ascontiguousarray(ohlc.astype(np.float32))
     atr = np.ascontiguousarray(atr.astype(np.float32))
-    sigma_price = np.ascontiguousarray(sigma_price.astype(np.float32))
     day_ids = np.ascontiguousarray(raw_bars_df["day_id"].to_numpy(dtype=np.int32))
     bar_in_day = np.ascontiguousarray(raw_bars_df["bar_in_day"].to_numpy(dtype=np.int32))
     session_end_mask = np.ascontiguousarray(raw_bars_df["is_session_end"].to_numpy(dtype=bool))
@@ -134,14 +132,11 @@ def build_preprocessed_arrays(raw_bars_df: pd.DataFrame, feature_config: Feature
         raise ValueError("OHLC preprocessing produced non-finite values")
     if not np.isfinite(atr).all():
         raise ValueError("ATR preprocessing produced non-finite values")
-    if not np.isfinite(sigma_price).all():
-        raise ValueError("Sigma-price preprocessing produced non-finite values")
 
     return PreprocessedArrays(
         ohlc=ohlc,
         static_features=static_features,
         atr=atr,
-        sigma_price=sigma_price,
         day_ids=day_ids,
         bar_in_day=bar_in_day,
         session_end_mask=session_end_mask,
