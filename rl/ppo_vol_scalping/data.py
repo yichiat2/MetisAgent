@@ -108,12 +108,12 @@ def build_preprocessed_arrays(raw_bars_df: pd.DataFrame, feature_config: Feature
     static_features = np.column_stack(
         [
             raw_bars_df["tau"].to_numpy(dtype=np.float64),
-            log_return,
+            # log_return,
             atr_over_close_milli,
             srvi,
-            vslope,
-            vmacd,
-            vmacd_slope,
+            # vslope,
+            # vmacd,
+            # vmacd_slope,
         ]
     )
 

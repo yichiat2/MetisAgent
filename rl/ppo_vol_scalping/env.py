@@ -10,7 +10,7 @@ HIGH_INDEX = 1
 LOW_INDEX = 2
 CLOSE_INDEX = 3
 
-PRICE_ACTION_LEVELS = jnp.array((0.0, 1.0, 2.0, 3.0), dtype=jnp.float32)
+PRICE_ACTION_LEVELS = jnp.array((0., 1.0, 2.0, 3.0), dtype=jnp.float32)
 QUOTE_SIZE_SHARES = 100.0
 
 

@@ -44,12 +44,12 @@ BAR_COLUMNS = (
 
 STATIC_FEATURE_NAMES = (
     "tau",
-    "log_return",
+    # "log_return",
     "atr_over_close_milli",
     "srvi",
-    "vslope",
-    "vmacd",
-    "vmacd_slope",
+    # "vslope",
+    # "vmacd",
+    # "vmacd_slope",
 )
 
 STATIC_FEATURE_DIM = len(STATIC_FEATURE_NAMES)

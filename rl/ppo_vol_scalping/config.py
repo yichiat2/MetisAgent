@@ -6,7 +6,7 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class DataConfig:
-    root: str = "NVDA"
+    root: str = "TSLA"
     start_date: int = 20200101
     end_date: int = 20251231
     train_window_bars: int = 80_000
@@ -18,7 +18,7 @@ class DataConfig:
 class FeatureConfig:
     fast_ema_length: int = 8
     slow_ema_length: int = 30
-    atr_length: int = 14
+    atr_length: int = 8
     srvi_length: int = 9
     epsilon: float = 1e-8
 
