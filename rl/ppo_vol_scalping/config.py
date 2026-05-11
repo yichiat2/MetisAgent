@@ -6,12 +6,12 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class DataConfig:
-    root: str = "TSLA"
+    root: str = "NVDA"
     start_date: int = 20200101
     end_date: int = 20251231
-    train_window_bars: int = 80_000
-    inference_window_bars: int = 40_000
-    fold_stride_bars: int = 40_000
+    train_window_bars: int = 150_000
+    inference_window_bars: int = 50_000
+    fold_stride_bars: int = 50_000
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,7 @@ class FeatureConfig:
     fast_ema_length: int = 8
     slow_ema_length: int = 30
     atr_length: int = 8
+    directional_atr_ema_length: int = 5
     srvi_length: int = 9
     epsilon: float = 1e-8
 
@@ -29,12 +30,14 @@ class EnvironmentConfig:
     episode_stride: int = 32
     max_inventory: int = 100
     flatten_at_session_end: bool = True
+    price_action_levels: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0)
+    quote_size_shares: float = 100.0
 
 
 @dataclass(frozen=True)
 class RewardConfig:
-    damped_pnl_eta: float = 0.25
-    inventory_penalty_eta: float = 0.00001
+    damped_pnl_eta: float = 0.15
+    inventory_penalty_eta: float = 0.0
     reward_epsilon: float = 1e-8
 
 
@@ -42,7 +45,7 @@ class RewardConfig:
 class PPOConfig:
     actor_learning_rate: float = 1e-5
     critic_learning_rate: float = 1e-5
-    discount: float = 0.99
+    discount: float = 1.0
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
     entropy_coefficient: float = 0.01
@@ -50,15 +53,25 @@ class PPOConfig:
     critic_l1: float = 0.
     minibatch_size: int = 64
     num_env: int = 32
-    num_update: int = 100
-    epochs: int = 10
+    num_update: int = 20
+    epochs: int = 5
 
 
 @dataclass(frozen=True)
 class ModelConfig:
-    hidden_sizes: tuple[int, ...] = (32, 32)
+    hidden_sizes: tuple[int, ...] = (8, 8)
     action_dim: int = 2
     action_cardinality: int = 4
+
+
+@dataclass(frozen=True)
+class CheckpointConfig:
+    file_dir: Path = field(default_factory=lambda: Path("checkpoints") / "ppo_vol_scalping")
+    file_name: str = "latest_fold.pkl"
+
+    @property
+    def file_path(self) -> Path:
+        return self.file_dir / self.file_name
 
 
 @dataclass(frozen=True)
@@ -79,6 +92,7 @@ class PPOVolScalpingConfig:
     reward: RewardConfig = field(default_factory=RewardConfig)
     ppo: PPOConfig = field(default_factory=PPOConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
 

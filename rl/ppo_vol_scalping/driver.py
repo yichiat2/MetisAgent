@@ -1,4 +1,6 @@
+import pickle
 from functools import partial
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +27,7 @@ from .visual import prepare_inference_payload, push_inference_metrics, start_das
 def _summarize_inference(
     config: PPOVolScalpingConfig,
     step_pnl: jax.Array,
+    step_rewards: jax.Array,
     step_returns: jax.Array,
     is_bankrupt: jax.Array,
     bid_fill: jax.Array,
@@ -35,6 +38,9 @@ def _summarize_inference(
         jnp.asarray(config.logging.evaluation_annualization_factor, dtype=jnp.float32)
     )
     cumulative_pnl = jnp.cumsum(step_pnl)
+    total_reward = jnp.sum(step_rewards)
+    num_steps = jnp.asarray(step_rewards.shape[0], dtype=jnp.float32)
+    normalized_episode_reward = total_reward * config.environment.episode_length / num_steps
     bankruptcy_mask = is_bankrupt > 0.0
     path_returns = jnp.where(bankruptcy_mask, -1.0, step_returns)
     wealth_curve = jnp.concatenate(
@@ -64,7 +70,9 @@ def _summarize_inference(
     transaction_count = jnp.sum(bid_counts + ask_counts, dtype=jnp.int32)
     return {
         "cumulative_pnl": cumulative_pnl,
+        "normalized_episode_reward": normalized_episode_reward,
         "total_pnl": cumulative_pnl[-1],
+        "total_reward": total_reward,
         "cumulative_return": cumulative_return,
         "final_cumulative_return": final_cumulative_return,
         "max_drawdown": max_drawdown,
@@ -86,6 +94,73 @@ def _compute_episode_max_drawdown(
     drawdown = 1.0 - portfolio_path / (running_peak + epsilon)
     return jnp.max(drawdown, axis=0)
 
+
+def _reset_optimizer_state(train_state: TrainState) -> TrainState:
+    step_dtype = jnp.asarray(train_state.step).dtype
+    return train_state.replace(
+        step=jnp.asarray(0, dtype=step_dtype),
+        opt_state=train_state.tx.init(train_state.params),
+    )
+
+
+def _save_fold_checkpoint(
+    config: PPOVolScalpingConfig,
+    actor_state: TrainState,
+    critic_state: TrainState,
+    rng: jax.Array,
+    completed_fold_id: int,
+    next_fold_index: int,
+) -> None:
+    checkpoint_path = config.checkpoint.file_path
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_payload = {
+        "actor_opt_state": jax.device_get(actor_state.opt_state),
+        "actor_params": jax.device_get(actor_state.params),
+        "actor_step": int(jax.device_get(actor_state.step)),
+        "completed_fold_id": completed_fold_id,
+        "critic_opt_state": jax.device_get(critic_state.opt_state),
+        "critic_params": jax.device_get(critic_state.params),
+        "critic_step": int(jax.device_get(critic_state.step)),
+        "next_fold_index": next_fold_index,
+        "rng": jax.device_get(rng),
+    }
+    with checkpoint_path.open("wb") as checkpoint_file:
+        pickle.dump(checkpoint_payload, checkpoint_file)
+    print(f"Saved checkpoint to {checkpoint_path}")
+
+
+def _load_fold_checkpoint(
+    config: PPOVolScalpingConfig,
+    actor_state: TrainState,
+    critic_state: TrainState,
+    rng: jax.Array,
+) -> tuple[TrainState, TrainState, jax.Array, int, int | None]:
+    checkpoint_path = config.checkpoint.file_path
+    if not checkpoint_path.exists():
+        print(f"No checkpoint found at {checkpoint_path}; starting from fold 0")
+        return actor_state, critic_state, rng, 0, None
+
+    with checkpoint_path.open("rb") as checkpoint_file:
+        checkpoint_payload = pickle.load(checkpoint_file)
+
+    actor_step_dtype = jnp.asarray(actor_state.step).dtype
+    critic_step_dtype = jnp.asarray(critic_state.step).dtype
+    actor_state = actor_state.replace(
+        step=jnp.asarray(checkpoint_payload["actor_step"], dtype=actor_step_dtype),
+        params=jax.tree_util.tree_map(jnp.asarray, checkpoint_payload["actor_params"]),
+        opt_state=jax.tree_util.tree_map(jnp.asarray, checkpoint_payload["actor_opt_state"]),
+    )
+    critic_state = critic_state.replace(
+        step=jnp.asarray(checkpoint_payload["critic_step"], dtype=critic_step_dtype),
+        params=jax.tree_util.tree_map(jnp.asarray, checkpoint_payload["critic_params"]),
+        opt_state=jax.tree_util.tree_map(jnp.asarray, checkpoint_payload["critic_opt_state"]),
+    )
+    rng = jnp.asarray(checkpoint_payload["rng"])
+    next_fold_index = int(checkpoint_payload.get("next_fold_index", 0))
+    completed_fold_id = checkpoint_payload.get("completed_fold_id")
+    print(f"Loaded checkpoint from {checkpoint_path}")
+    return actor_state, critic_state, rng, next_fold_index, completed_fold_id
+
 @partial(jax.jit, static_argnames=("config",))
 def run_fold_inference(
     config: PPOVolScalpingConfig,
@@ -100,10 +175,10 @@ def run_fold_inference(
     def _env_step(step_carry, unused):
         obs, env_state = step_carry
 
-        dist = actor_state.apply_fn({"params": actor_state.params}, obs)
+        dist = actor_state.apply_fn({"params": actor_state.params}, obs.actor)
         action = deterministic_action(dist)
 
-        next_obs, next_state, _, _, info = env_step(
+        next_obs, next_state, reward, _, info = env_step(
             env_state,
             action,
             env_param,
@@ -122,6 +197,7 @@ def run_fold_inference(
             "inventory": info["inventory_after"],
             "pnl": info["pnl"],
             "portfolio_value": info["portfolio_value_after"],
+            "reward": reward,
             "return": info["return"],
         }
         return (next_obs, next_state), step_info
@@ -136,6 +212,7 @@ def run_fold_inference(
     summary_metrics = _summarize_inference(
         config=config,
         step_pnl=step_info["pnl"],
+        step_rewards=step_info["reward"],
         step_returns=step_info["return"],
         is_bankrupt=step_info["is_bankrupt"],
         bid_fill=step_info["bid_fill"],
@@ -160,10 +237,6 @@ def run_fold_update(
     episode_length = config.environment.episode_length
     num_episodes = episode_start_indices.shape[0]
     num_runs = num_episodes // num_envs
-    discount_factors = jnp.power(
-        jnp.asarray(config.ppo.discount, dtype=jnp.float32),
-        jnp.arange(episode_length, dtype=jnp.float32),
-    )
 
     # Shuffle episode start indices and drop the tail so shape is (num_runs, num_envs).
     rng, shuffle_rng = jax.random.split(rng)
@@ -182,10 +255,10 @@ def run_fold_update(
 
             rng, sample_rng = jax.random.split(rng)
 
-            dist = actor_state.apply_fn({"params": actor_state.params}, obs)
+            dist = actor_state.apply_fn({"params": actor_state.params}, obs.actor)
             actions, log_probs = sample_and_log_prob(sample_rng, dist)
 
-            values = critic_state.apply_fn({"params": critic_state.params}, obs)
+            values = critic_state.apply_fn({"params": critic_state.params}, obs.critic)
 
             next_obs, next_states, rewards, dones, infos = jax.vmap(
                 lambda state, action: env_step(state, action, env_param, config.reward)
@@ -215,7 +288,7 @@ def run_fold_update(
             epsilon=config.reward.reward_epsilon,
         )
 
-        last_val = critic_state.apply_fn({"params": critic_state.params}, last_obs)
+        last_val = critic_state.apply_fn({"params": critic_state.params}, last_obs.critic)
 
         def _calculate_gae(traj_batch, last_val):
             def _get_advantages(gae_and_next_value, transition):
@@ -235,10 +308,7 @@ def run_fold_update(
             return advantages, advantages + traj_batch.value
 
         advantages, targets = _calculate_gae(traj_batch, last_val)
-        discounted_episode_reward = jnp.sum(
-            traj_batch.reward * discount_factors[:, None],
-            axis=0,
-        ).mean()
+        episode_reward = jnp.sum(traj_batch.reward, axis=0).mean()
 
         def _update_epoch(update_state, unused):
             actor_state, critic_state, traj_batch, advantages, targets, rng = update_state
@@ -266,11 +336,11 @@ def run_fold_update(
                 traj, adv, tgt = minibatch
 
                 def _actor_loss(actor_params):
-                    dist = actor_state.apply_fn({"params": actor_params}, traj.obs)
+                    dist = actor_state.apply_fn({"params": actor_params}, traj.obs.actor)
                     log_prob = get_log_prob(dist, traj.action)
                     ratio = jnp.exp(log_prob - traj.log_prob)
                     norm_adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-                    norm_adv = jnp.clip(norm_adv, -3.0, 3.0)
+                    # norm_adv = jnp.clip(norm_adv, -3.0, 3.0)
                     loss1 = ratio * norm_adv
                     loss2 = jnp.clip(
                         ratio,
@@ -283,7 +353,7 @@ def run_fold_update(
                     return total, (actor_loss, entropy)
 
                 def _critic_loss(critic_params):
-                    value = critic_state.apply_fn({"params": critic_params}, traj.obs)
+                    value = critic_state.apply_fn({"params": critic_params}, traj.obs.critic)
                     vf_loss = 0.5 * jnp.square(value - tgt).mean()
                     return vf_loss, vf_loss
 
@@ -327,7 +397,7 @@ def run_fold_update(
         actor_state, critic_state, _, _, _, rng = update_state
 
         run_metrics = (
-            discounted_episode_reward,
+            episode_reward,
             jnp.mean(episode_max_drawdown),
         )
         return (actor_state, critic_state, rng), (loss_info, run_metrics)
@@ -339,31 +409,43 @@ def run_fold_update(
     )
 
     _, critic_losses, actor_losses, entropies = run_loss_info
-    run_discounted_episode_rewards, run_avg_max_drawdown = run_metrics
+    run_episode_rewards, run_avg_max_drawdown = run_metrics
     avg_actor_loss_per_epoch = jnp.mean(actor_losses, axis=-1)
     avg_critic_loss_per_epoch = jnp.mean(critic_losses, axis=-1)
     avg_entropy_per_epoch = jnp.mean(entropies, axis=-1)
     training_metrics = {
         "avg_actor_loss": jnp.mean(avg_actor_loss_per_epoch[:, -1]),
         "avg_critic_loss": jnp.mean(avg_critic_loss_per_epoch[:, -1]),
-        "avg_discounted_episode_reward": jnp.mean(run_discounted_episode_rewards),
+        "avg_episode_reward": jnp.mean(run_episode_rewards),
         "avg_entropy": jnp.mean(avg_entropy_per_epoch[:, -1]),
         "avg_episode_max_drawdown": jnp.mean(run_avg_max_drawdown),
     }
 
     return actor_state, critic_state, rng, training_metrics
 
-def run(
+def train(
     folds: list[Fold],
     preprocessed_arrays: PreprocessedArrays,
-    config: PPOVolScalpingConfig | None = None,
+    config: PPOVolScalpingConfig,
 ) -> None:
     rng = jax.random.PRNGKey(config.seed)
     rng, _rng = jax.random.split(rng)
     actor_state, critic_state = create_train_states(config=config, rng=_rng)
+    
+    # actor_state, critic_state, rng, start_fold_index, completed_fold_id = _load_fold_checkpoint(
+    #     config=config,
+    #     actor_state=actor_state,
+    #     critic_state=critic_state,
+    #     rng=rng,
+    # )
+   
+    for fold_index, fold in enumerate(folds):
+        if fold_index > 0:
+            actor_state = _reset_optimizer_state(actor_state)
+            critic_state = _reset_optimizer_state(critic_state)
 
-    for fold in folds:
         print(f"Running fold {fold.fold_id}...")
+        
         train_arrays = preprocessed_arrays[fold.train_start:fold.train_end]
         infer_arrays = preprocessed_arrays[fold.inference_start:fold.inference_end]
         episode_start_indices = jnp.asarray(fold.episode_start_indices)
@@ -391,41 +473,73 @@ def run(
                 episode_start_indices=episode_start_indices,
                 rng=rng,
             )
-            metrics = run_fold_inference(
+            infer_metrics = run_fold_inference(
                 config=config,
                 actor_state=actor_state,
                 env_param=infer_env_param,
             )
             training_metrics_host = jax.device_get(training_metrics)
-            metrics_host = jax.device_get(metrics)
+            infer_metrics_host = jax.device_get(infer_metrics)
+            train_infer_metrics_host = None
             if update_step == config.ppo.num_update - 1:
+                train_infer_metrics = run_fold_inference(
+                    config=config,
+                    actor_state=actor_state,
+                    env_param=env_param,
+                )
+                train_infer_metrics_host = jax.device_get(train_infer_metrics)
                 start_dashboard_server()
                 push_inference_metrics(
                     prepare_inference_payload(
-                        metrics=metrics_host,
+                        metrics=infer_metrics_host,
                         ohlc=infer_arrays.ohlc,
                         fold_id=fold.fold_id,
                         update_step=update_step + 1,
                         num_updates=config.ppo.num_update,
                     )
                 )
-            print(
-                f"  Update {update_step + 1}/{config.ppo.num_update}: "
-                f"train_actor_loss={float(training_metrics_host['avg_actor_loss']):.6f}, "
-                f"train_critic_loss={float(training_metrics_host['avg_critic_loss']):.6f}, "
-                f"train_entropy={float(training_metrics_host['avg_entropy']):.6f}, "
-                f"train_discounted_episode_reward={float(training_metrics_host['avg_discounted_episode_reward']):.6f}, "
-                f"train_avg_episode_max_drawdown={float(training_metrics_host['avg_episode_max_drawdown']):.6f}, "
-                f"infer_total_pnl={float(metrics_host['total_pnl']):.6f}, "
-                f"infer_cumulative_return={float(metrics_host['final_cumulative_return']):.6f}, "
-                f"infer_sharpe={float(metrics_host['sharpe_ratio']):.6f}, "
-                f"infer_sortino={float(metrics_host['sortino_ratio']):.6f}, "
-                f"infer_max_drawdown={float(metrics_host['max_drawdown']):.6f}, "
-                f"infer_transactions={int(metrics_host['transaction_count'])}, "
-                f"infer_bankruptcy={bool(metrics_host['bankruptcy'])}"
+            train_message = (
+                f"  Update {update_step + 1}/{config.ppo.num_update} "
+                f"[train] actor loss: {float(training_metrics_host['avg_actor_loss']):.6f}, "
+                f"critic loss: {float(training_metrics_host['avg_critic_loss']):.6f}, "
+                f"entropy: {float(training_metrics_host['avg_entropy']):.6f}, "
+                f"episode reward: {float(training_metrics_host['avg_episode_reward']):.6f}, "
+                f"episode max drawdown: {float(training_metrics_host['avg_episode_max_drawdown']):.6f}"
             )
-        # pause between folds to allow dashboard inspection
-        input("Press Enter to continue to the next fold...")
+            if train_infer_metrics_host is not None:
+                train_message += (
+                    f", in-sample pnl: {float(train_infer_metrics_host['total_pnl']):.6f}, "
+                    f"in-sample episode reward: {float(train_infer_metrics_host['normalized_episode_reward']):.6f}, "
+                    f"in-sample cumulative return: {float(train_infer_metrics_host['final_cumulative_return']):.6f}, "
+                    f"in-sample sharpe: {float(train_infer_metrics_host['sharpe_ratio']):.6f}, "
+                    f"in-sample sortino: {float(train_infer_metrics_host['sortino_ratio']):.6f}, "
+                    f"in-sample max drawdown: {float(train_infer_metrics_host['max_drawdown']):.6f}, "
+                    f"in-sample transactions: {int(train_infer_metrics_host['transaction_count'])}, "
+                    f"in-sample bankruptcy: {bool(train_infer_metrics_host['bankruptcy'])}"
+                )
+            infer_message = (
+                f"[infer] pnl: {float(infer_metrics_host['total_pnl']):.6f}, "
+                f"episode reward: {float(infer_metrics_host['normalized_episode_reward']):.6f}, "
+                f"cumulative return: {float(infer_metrics_host['final_cumulative_return']):.6f}, "
+                f"sharpe: {float(infer_metrics_host['sharpe_ratio']):.6f}, "
+                f"sortino: {float(infer_metrics_host['sortino_ratio']):.6f}, "
+                f"max drawdown: {float(infer_metrics_host['max_drawdown']):.6f}, "
+                f"transactions: {int(infer_metrics_host['transaction_count'])}, "
+                f"bankruptcy: {bool(infer_metrics_host['bankruptcy'])}"
+            )
+            print(f"{train_message}. {infer_message}.")
+       
+        if fold_index + 1 < len(folds):
+            save = input("Press Y to Save the model and continue to the next fold...")
+            if save.lower() == "y":
+                _save_fold_checkpoint(
+                    config=config,
+                    actor_state=actor_state,
+                    critic_state=critic_state,
+                    rng=rng,
+                    completed_fold_id=fold.fold_id,
+                    next_fold_index=folds[fold_index + 1].fold_id,
+                )
 
 
 def main() -> None:
@@ -440,7 +554,7 @@ def main() -> None:
         episode_length=config.environment.episode_length,
         episode_stride=config.environment.episode_stride,
     )
-    run(folds=folds, preprocessed_arrays=preprocessed_arrays, config=config)
+    train(folds=folds, preprocessed_arrays=preprocessed_arrays, config=config)
 
 
 if __name__ == "__main__":

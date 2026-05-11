@@ -12,7 +12,7 @@ import numpy as np
 import optax
 
 from .config import PPOVolScalpingConfig
-from .contracts import STATE_DIM
+from .contracts import ACTOR_STATE_DIM, CRITIC_STATE_DIM
 
 
 def sample_and_log_prob(
@@ -94,7 +94,8 @@ def create_train_states(
     config: PPOVolScalpingConfig,
     rng: jax.Array,
 ) -> tuple[TrainState, TrainState]:
-    dummy_state = jnp.zeros((STATE_DIM,), dtype=jnp.float32)
+    dummy_actor_state = jnp.zeros((ACTOR_STATE_DIM,), dtype=jnp.float32)
+    dummy_critic_state = jnp.zeros((CRITIC_STATE_DIM,), dtype=jnp.float32)
     actor = Actor(
         hidden_sizes=config.model.hidden_sizes,
         action_dim=config.model.action_dim,
@@ -103,8 +104,8 @@ def create_train_states(
     critic = Critic(hidden_sizes=config.model.hidden_sizes)
 
     actor_rng, critic_rng = jax.random.split(rng)
-    actor_params = actor.init(actor_rng, dummy_state)["params"]
-    critic_params = critic.init(critic_rng, dummy_state)["params"]
+    actor_params = actor.init(actor_rng, dummy_actor_state)["params"]
+    critic_params = critic.init(critic_rng, dummy_critic_state)["params"]
 
     actor_tx = optax.adam(learning_rate=config.ppo.actor_learning_rate)
     critic_tx = optax.adam(learning_rate=config.ppo.critic_learning_rate)

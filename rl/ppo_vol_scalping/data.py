@@ -16,6 +16,10 @@ def _ema(values: np.ndarray, length: int) -> np.ndarray:
     return pd.Series(values, copy=False).ewm(span=length, adjust=False).mean().to_numpy(dtype=np.float64)
 
 
+def _rma(values: np.ndarray, length: int) -> np.ndarray:
+    return pd.Series(values, copy=False).ewm(alpha=1.0 / length, adjust=False).mean().to_numpy(dtype=np.float64)
+
+
 def _rolling_sum(values: np.ndarray, window: int) -> np.ndarray:
     return pd.Series(values, copy=False).rolling(window=window, min_periods=1).sum().to_numpy(dtype=np.float64)
 
@@ -91,13 +95,20 @@ def build_preprocessed_arrays(raw_bars_df: pd.DataFrame, feature_config: Feature
         ]
     )
     atr = _ema(true_range, feature_config.atr_length)
+    ema_atr_close = _ema(close, feature_config.atr_length)
+
+    close_delta = close - prev_close
+    directional_true_range_up = np.where(close_delta > 0.0, true_range, 0.0)
+    directional_true_range_down = np.where(close_delta < 0.0, true_range, 0.0)
+    atr_up = _ema(directional_true_range_up, feature_config.directional_atr_ema_length)
+    atr_down = _ema(directional_true_range_down, feature_config.directional_atr_ema_length)
+    atr_imbalance = (atr_up - atr_down) / np.maximum(atr, feature_config.epsilon)
 
     signed_variance = variance_proxy * np.sign(log_return)
     srvi_num = _rolling_sum(signed_variance, feature_config.srvi_length)
     srvi_den = _rolling_sum(variance_proxy, feature_config.srvi_length)
     srvi = srvi_num / np.maximum(srvi_den, feature_config.epsilon)
-    atr_over_close_milli = atr / np.maximum(close, feature_config.epsilon) * 1000.0
-
+    atr_over_close_milli = atr / np.maximum(ema_atr_close, feature_config.epsilon) * 1000.0
     vslope = np.zeros_like(close)
     vslope[1:] = (ema_slow[1:] - ema_slow[:-1]) / (atr[1:] + feature_config.epsilon)
 
@@ -107,10 +118,11 @@ def build_preprocessed_arrays(raw_bars_df: pd.DataFrame, feature_config: Feature
 
     static_features = np.column_stack(
         [
-            raw_bars_df["tau"].to_numpy(dtype=np.float64),
+            # raw_bars_df["tau"].to_numpy(dtype=np.float64),
             # log_return,
             atr_over_close_milli,
-            srvi,
+            # srvi,
+            atr_imbalance,
             # vslope,
             # vmacd,
             # vmacd_slope,

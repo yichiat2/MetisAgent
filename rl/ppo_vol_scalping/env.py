@@ -3,15 +3,12 @@ from __future__ import annotations
 from flax import struct
 import jax.numpy as jnp
 from .config import PPOVolScalpingConfig, RewardConfig
-from .contracts import PreprocessedArrays
+from .contracts import Observation, PreprocessedArrays
 
 OPEN_INDEX = 0
 HIGH_INDEX = 1
 LOW_INDEX = 2
 CLOSE_INDEX = 3
-
-PRICE_ACTION_LEVELS = jnp.array((0., 1.0, 2.0, 3.0), dtype=jnp.float32)
-QUOTE_SIZE_SHARES = 100.0
 
 
 @struct.dataclass
@@ -26,8 +23,11 @@ class EnvState:
 
 @struct.dataclass
 class EnvParam:
+    episode_length: jnp.ndarray
     max_inventory: float
     flatten_at_session_end: bool
+    price_action_levels: jnp.ndarray
+    quote_size_shares: jnp.ndarray
     ohlc: jnp.ndarray
     static_features: jnp.ndarray
     atr: jnp.ndarray
@@ -38,9 +38,15 @@ class EnvParam:
 
 
 def build_env_param(config: PPOVolScalpingConfig, train_arrays: PreprocessedArrays) -> EnvParam:
+    if config.model.action_cardinality != len(config.environment.price_action_levels):
+        raise ValueError("Model action_cardinality must match environment price_action_levels")
+
     return EnvParam(
+        episode_length=jnp.asarray(config.environment.episode_length, dtype=jnp.float32),
         max_inventory=float(config.environment.max_inventory),
         flatten_at_session_end=config.environment.flatten_at_session_end,
+        price_action_levels=jnp.asarray(config.environment.price_action_levels, dtype=jnp.float32),
+        quote_size_shares=jnp.asarray(config.environment.quote_size_shares, dtype=jnp.float32),
         ohlc=jnp.asarray(train_arrays.ohlc),
         static_features=jnp.asarray(train_arrays.static_features),
         atr=jnp.asarray(train_arrays.atr),
@@ -54,14 +60,46 @@ def build_observation(static_features: jnp.ndarray, inventory: float, max_invent
     return jnp.concatenate([static_features, jnp.asarray(inventory_feature, dtype=jnp.float32)[None]], axis=-1)
 
 
+def build_critic_observation(
+    actor_observation: jnp.ndarray,
+    step_index: jnp.ndarray | float,
+    episode_length: jnp.ndarray,
+) -> jnp.ndarray:
+    remaining_steps = jnp.maximum(
+        episode_length - jnp.asarray(step_index, dtype=jnp.float32),
+        0.0,
+    )
+    remaining_fraction = remaining_steps / episode_length
+    return jnp.concatenate(
+        [actor_observation, jnp.asarray(remaining_fraction, dtype=jnp.float32)[None]],
+        axis=-1,
+    )
+
+
+def build_observations(
+    static_features: jnp.ndarray,
+    inventory: float,
+    max_inventory: float,
+    step_index: jnp.ndarray | float,
+    episode_length: jnp.ndarray,
+) -> Observation:
+    actor_observation = build_observation(static_features, inventory, max_inventory)
+    critic_observation = build_critic_observation(
+        actor_observation,
+        step_index,
+        episode_length,
+    )
+    return Observation(actor=actor_observation, critic=critic_observation)
+
+
 def env_reset(
     env_param: EnvParam,
     global_index: int,
     initial_inventory: float = 0.0,
     initial_cash: float = 0.0,
-) -> tuple[jnp.ndarray, EnvState]:
+) -> tuple[Observation, EnvState]:
     first_close = env_param.ohlc[global_index, CLOSE_INDEX]
-    return_baseline = jnp.asarray(QUOTE_SIZE_SHARES, dtype=jnp.float32) * first_close
+    return_baseline = env_param.quote_size_shares * first_close
     state = EnvState(
         step_index=0,
         global_index=global_index,
@@ -71,7 +109,13 @@ def env_reset(
         is_bankrupt=jnp.asarray(0.0, dtype=jnp.float32),
     )
     static_features_0 = env_param.static_features[global_index]
-    observation = build_observation(static_features_0, state.inventory, env_param.max_inventory)
+    observation = build_observations(
+        static_features_0,
+        state.inventory,
+        env_param.max_inventory,
+        state.step_index,
+        env_param.episode_length,
+    )
     return observation, state
 
 
@@ -80,7 +124,7 @@ def env_step(
     action: jnp.ndarray,  # [2] categorical ids
     env_param: EnvParam,
     reward_config: RewardConfig,
-) -> tuple[jnp.ndarray, EnvState, jnp.ndarray, jnp.ndarray, dict[str, jnp.ndarray]]:
+) -> tuple[Observation, EnvState, jnp.ndarray, jnp.ndarray, dict[str, jnp.ndarray]]:
     # step_index tracks rollout progress; global_index selects the fold-local arrays.
     next_step_index = state.step_index + 1
     next_global_index = state.global_index + 1
@@ -97,9 +141,10 @@ def env_step(
     next_close = next_bar[CLOSE_INDEX]
     current_atr = env_param.atr[state.global_index]
 
-    action_index = jnp.clip(action, 0, 3)
-    bid_level = PRICE_ACTION_LEVELS[action_index[0]]
-    ask_level = PRICE_ACTION_LEVELS[action_index[1]]
+    max_action_index = env_param.price_action_levels.shape[0] - 1
+    action_index = jnp.asarray(jnp.clip(action, 0, max_action_index), dtype=jnp.int32)
+    bid_level = env_param.price_action_levels[action_index[0]]
+    ask_level = env_param.price_action_levels[action_index[1]]
 
     no_quotes = (action_index[0] == 0) & (action_index[1] == 0)
     buy_market = (action_index[0] == 0) & (action_index[1] > 0)
@@ -111,7 +156,7 @@ def env_step(
     ask_price = jnp.where(sell_market, next_open, ask_limit_price)
 
     max_inventory = env_param.max_inventory
-    raw_quote_size = jnp.asarray(QUOTE_SIZE_SHARES, dtype=jnp.float32)
+    raw_quote_size = env_param.quote_size_shares
     bid_size = jnp.where(
         no_quotes,
         0.0,
@@ -184,10 +229,12 @@ def env_step(
         return_baseline=state.return_baseline,
         is_bankrupt=is_bankrupt,
     )
-    next_observation = build_observation(
+    next_observation = build_observations(
         env_param.static_features[next_global_index],
         next_inventory,
         env_param.max_inventory,
+        next_step_index,
+        env_param.episode_length,
     )
     done = 0.0
     portfolio_value_after = jnp.where(
@@ -242,8 +289,9 @@ __all__ = [
     "HIGH_INDEX",
     "LOW_INDEX",
     "OPEN_INDEX",
-    "QUOTE_SIZE_SHARES",
     "build_observation",
+    "build_critic_observation",
+    "build_observations",
     "env_reset",
     "env_step",
 ]

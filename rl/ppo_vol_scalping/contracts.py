@@ -43,17 +43,25 @@ BAR_COLUMNS = (
 )
 
 STATIC_FEATURE_NAMES = (
-    "tau",
+    # "tau",
     # "log_return",
     "atr_over_close_milli",
-    "srvi",
+    # "srvi",
+    "atr_imbalance",
     # "vslope",
     # "vmacd",
     # "vmacd_slope",
 )
 
 STATIC_FEATURE_DIM = len(STATIC_FEATURE_NAMES)
-STATE_DIM = STATIC_FEATURE_DIM + 1
+ACTOR_STATE_DIM = STATIC_FEATURE_DIM + 1
+CRITIC_STATE_DIM = ACTOR_STATE_DIM + 1
+STATE_DIM = ACTOR_STATE_DIM
+
+
+class Observation(NamedTuple):
+    actor: jnp.ndarray
+    critic: jnp.ndarray
 
 
 @dataclass(frozen=True)
@@ -114,5 +122,5 @@ class Transition(NamedTuple):
     value: jnp.ndarray
     reward: jnp.ndarray
     log_prob: jnp.ndarray
-    obs: jnp.ndarray
+    obs: Observation
     info: jnp.ndarray
