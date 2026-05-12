@@ -43,6 +43,9 @@ def prepare_inference_payload(
     if actions.shape[0] != num_steps:
         raise ValueError("Action series must align with the inference horizon")
 
+    reservation_price = np.asarray(host_metrics["reservation_price"], dtype=np.float32)
+    spread = np.asarray(host_metrics["spread"], dtype=np.float32)
+
     return {
         "fold_id": int(fold_id),
         "update_step": int(update_step),
@@ -56,12 +59,14 @@ def prepare_inference_payload(
         "bankruptcy": bool(host_metrics["bankruptcy"]),
         "metrics": host_metrics,
         "ohlc": aligned_ohlc[1:, :4],
+        "reservation_price": reservation_price,
+        "spread": spread,
         "bid_price": bid_price,
         "ask_price": ask_price,
         "inventory": np.asarray(host_metrics["inventory"], dtype=np.float32),
         "pnl": np.asarray(host_metrics["pnl"], dtype=np.float32),
         "cumulative_pnl": np.asarray(host_metrics["cumulative_pnl"], dtype=np.float32),
-        "actions": actions,
+        "actions": np.asarray(host_metrics["actions"], dtype=np.float32),
     }
 
 
@@ -134,12 +139,13 @@ def build_inference_figure(payload: Mapping[str, Any]):
     from plotly.subplots import make_subplots
 
     ohlc = np.asarray(payload["ohlc"], dtype=np.float32)
+    reservation_price = np.asarray(payload["reservation_price"], dtype=np.float32)
     bid_price = np.asarray(payload["bid_price"], dtype=np.float32)
     ask_price = np.asarray(payload["ask_price"], dtype=np.float32)
     inventory = np.asarray(payload["inventory"], dtype=np.float32)
     pnl = np.asarray(payload["pnl"], dtype=np.float32)
     cumulative_pnl = np.asarray(payload["cumulative_pnl"], dtype=np.float32)
-    actions = np.asarray(payload["actions"], dtype=np.int32)
+    actions = np.asarray(payload["actions"], dtype=np.float32)
     timestep = np.arange(ohlc.shape[0], dtype=np.int32)
 
     fig = make_subplots(
@@ -151,12 +157,12 @@ def build_inference_figure(payload: Mapping[str, Any]):
         specs=[
             [{"secondary_y": True}],
             [{"secondary_y": True}],
-            [{"secondary_y": False}],
+            [{"secondary_y": True}],
         ],
         subplot_titles=(
-            "OHLC (t + 1) with bid/ask quotes (t) and inventory (t + 1)",
+            "OHLC (t + 1) with reservation price and bid/ask quotes (t)",
             "Cumulative PnL and step PnL",
-            "Bid and ask actions (100-share quotes)",
+            "A1 inventory skew and A2 spread multiplier",
         ),
     )
 
@@ -170,6 +176,18 @@ def build_inference_figure(payload: Mapping[str, Any]):
             name="OHLC t+1",
             increasing_line_color="#0b8f55",
             decreasing_line_color="#d1495b",
+        ),
+        row=1,
+        col=1,
+        secondary_y=False,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=timestep,
+            y=reservation_price,
+            mode="lines",
+            name="Reservation price t",
+            line={"color": "#111827", "width": 1.2, "dash": "dash"},
         ),
         row=1,
         col=1,
@@ -237,7 +255,7 @@ def build_inference_figure(payload: Mapping[str, Any]):
         secondary_y=True,
     )
 
-    action_names = ("Bid", "Ask")
+    action_names = ("A1 inventory skew", "A2 spread multiplier")
     action_colors = ("#2563eb", "#dc2626")
     if actions.ndim != 2 or actions.shape[1] != len(action_names):
         raise ValueError("Expected action series with shape (num_steps, 2)")
@@ -253,21 +271,15 @@ def build_inference_figure(payload: Mapping[str, Any]):
             ),
             row=3,
             col=1,
-            secondary_y=False,
+            secondary_y=bool(index),
         )
 
     fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="Inventory", row=1, col=1, secondary_y=True)
     fig.update_yaxes(title_text="Cumulative PnL", row=2, col=1, secondary_y=False)
     fig.update_yaxes(title_text="Step PnL", row=2, col=1, secondary_y=True)
-    fig.update_yaxes(
-        title_text="Action id",
-        row=3,
-        col=1,
-        tickmode="array",
-        tickvals=[0, 1, 2, 3],
-        range=[-0.2, 3.2],
-    )
+    fig.update_yaxes(title_text="A1 inventory skew", row=3, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="A2 spread multiplier", row=3, col=1, secondary_y=True)
     fig.update_xaxes(title_text="Timestep", row=3, col=1)
     fig.update_layout(
         template="plotly_white",

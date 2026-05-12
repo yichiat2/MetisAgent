@@ -26,8 +26,9 @@ class EnvParam:
     episode_length: jnp.ndarray
     max_inventory: float
     flatten_at_session_end: bool
-    price_action_levels: jnp.ndarray
     quote_size_shares: jnp.ndarray
+    action_low: jnp.ndarray
+    action_high: jnp.ndarray
     ohlc: jnp.ndarray
     static_features: jnp.ndarray
     atr: jnp.ndarray
@@ -38,15 +39,13 @@ class EnvParam:
 
 
 def build_env_param(config: PPOVolScalpingConfig, train_arrays: PreprocessedArrays) -> EnvParam:
-    if config.model.action_cardinality != len(config.environment.price_action_levels):
-        raise ValueError("Model action_cardinality must match environment price_action_levels")
-
     return EnvParam(
         episode_length=jnp.asarray(config.environment.episode_length, dtype=jnp.float32),
         max_inventory=float(config.environment.max_inventory),
         flatten_at_session_end=config.environment.flatten_at_session_end,
-        price_action_levels=jnp.asarray(config.environment.price_action_levels, dtype=jnp.float32),
         quote_size_shares=jnp.asarray(config.environment.quote_size_shares, dtype=jnp.float32),
+        action_low=jnp.asarray(config.environment.action_low, dtype=jnp.float32),
+        action_high=jnp.asarray(config.environment.action_high, dtype=jnp.float32),
         ohlc=jnp.asarray(train_arrays.ohlc),
         static_features=jnp.asarray(train_arrays.static_features),
         atr=jnp.asarray(train_arrays.atr),
@@ -54,6 +53,13 @@ def build_env_param(config: PPOVolScalpingConfig, train_arrays: PreprocessedArra
         bar_in_day=jnp.asarray(train_arrays.bar_in_day),
         session_end_mask=jnp.asarray(train_arrays.session_end_mask),
     )
+
+
+def _scale_action(action: jnp.ndarray, env_param: EnvParam) -> tuple[jnp.ndarray, jnp.ndarray]:
+    normalized_action = jnp.clip(jnp.asarray(action, dtype=jnp.float32), 0.0, 1.0)
+    action_scale = env_param.action_high - env_param.action_low
+    scaled_action = env_param.action_low + action_scale * normalized_action
+    return normalized_action, scaled_action
 
 def build_observation(static_features: jnp.ndarray, inventory: float, max_inventory: float) -> jnp.ndarray:
     inventory_feature = inventory / max_inventory
@@ -121,7 +127,7 @@ def env_reset(
 
 def env_step(
     state: EnvState,
-    action: jnp.ndarray,  # [2] categorical ids
+    action: jnp.ndarray,
     env_param: EnvParam,
     reward_config: RewardConfig,
 ) -> tuple[Observation, EnvState, jnp.ndarray, jnp.ndarray, dict[str, jnp.ndarray]]:
@@ -141,57 +147,42 @@ def env_step(
     next_close = next_bar[CLOSE_INDEX]
     current_atr = env_param.atr[state.global_index]
 
-    max_action_index = env_param.price_action_levels.shape[0] - 1
-    action_index = jnp.asarray(jnp.clip(action, 0, max_action_index), dtype=jnp.int32)
-    bid_level = env_param.price_action_levels[action_index[0]]
-    ask_level = env_param.price_action_levels[action_index[1]]
+    normalized_action, scaled_action = _scale_action(action, env_param)
+    reservation_price = current_close - scaled_action[0] * current_atr
+    spread = scaled_action[1] * current_atr
+    bid_price = reservation_price - 0.5 * spread
+    ask_price = reservation_price + 0.5 * spread
 
-    no_quotes = (action_index[0] == 0) & (action_index[1] == 0)
-    buy_market = (action_index[0] == 0) & (action_index[1] > 0)
-    sell_market = (action_index[1] == 0) & (action_index[0] > 0)
-
-    bid_limit_price = current_close - bid_level * current_atr
-    ask_limit_price = current_close + ask_level * current_atr
-    bid_price = jnp.where(buy_market, next_open, bid_limit_price)
-    ask_price = jnp.where(sell_market, next_open, ask_limit_price)
 
     max_inventory = env_param.max_inventory
     raw_quote_size = env_param.quote_size_shares
-    bid_size = jnp.where(
-        no_quotes,
-        0.0,
-        jnp.minimum(raw_quote_size, jnp.maximum(max_inventory - inventory_before, 0)),
+    bid_size = jnp.minimum(
+        raw_quote_size,
+        jnp.maximum(max_inventory - inventory_before, 0),
     )
-    ask_size = jnp.where(
-        no_quotes,
-        0.0,
-        jnp.minimum(raw_quote_size, jnp.maximum(max_inventory + inventory_before, 0)),
+    ask_size = jnp.minimum(
+        raw_quote_size,
+        jnp.maximum(max_inventory + inventory_before, 0),
     )
 
     bid_fill = jnp.where(
-        no_quotes,
+        valid_transition & (next_bar[LOW_INDEX] <= bid_price),
+        1.0,
         0.0,
-        jnp.where(
-            buy_market,
-            jnp.where(valid_transition, 1.0, 0.0),
-            jnp.where(valid_transition & (next_bar[LOW_INDEX] <= bid_limit_price), 1.0, 0.0),
-        ),
     )
     ask_fill = jnp.where(
-        no_quotes,
+        valid_transition & (next_bar[HIGH_INDEX] >= ask_price),
+        1.0,
         0.0,
-        jnp.where(
-            sell_market,
-            jnp.where(valid_transition, 1.0, 0.0),
-            jnp.where(valid_transition & (next_bar[HIGH_INDEX] >= ask_limit_price), 1.0, 0.0),
-        ),
     )
+    bid_execution_price = jnp.minimum(bid_price, next_open)
+    ask_execution_price = jnp.maximum(ask_price, next_open)
     inventory_after_trade = inventory_before + bid_fill * bid_size - ask_fill * ask_size
 
     cash_after_trade = (
         cash_before
-        - bid_fill * bid_size * bid_price
-        + ask_fill * ask_size * ask_price
+        - bid_fill * bid_size * bid_execution_price
+        + ask_fill * ask_size * ask_execution_price
     )
     mark_close = jnp.where(valid_transition, next_close, current_close)
     equity_before = cash_before + inventory_before * current_close
@@ -211,15 +202,15 @@ def env_step(
     )
 
     log_ret = jnp.log(portfolio_value_after_mark / portfolio_value_before) * 100
-    damped_log_ret = log_ret - jnp.maximum(0.0, damped_pnl_eta * log_ret)
+    damped_log_ret = log_ret - damped_pnl_eta * jnp.maximum(0.0, log_ret)
 
-    damped_pnl = pnl - jnp.maximum(0.0, damped_pnl_eta * pnl)
+    damped_pnl = pnl - damped_pnl_eta * jnp.square(jnp.maximum(0.0, pnl))
     flattened_cash = cash_after_trade + inventory_after_trade * current_close
     next_cash = jnp.where(should_flatten, flattened_cash, cash_after_trade)
     next_inventory = jnp.where(should_flatten, 0., inventory_after_trade)
     inventory_feature = next_inventory / env_param.max_inventory
     inventory_penalty = inventory_penalty_eta * jnp.square(inventory_feature)
-    reward = damped_log_ret
+    reward = damped_log_ret # - inventory_penalty
         
     next_state = EnvState(
         step_index=next_step_index,
@@ -244,15 +235,15 @@ def env_step(
     )
 
     info = {
-        "action": action_index,
-        "action_rescaled": jnp.asarray((bid_level, ask_level), dtype=jnp.float32),
+        "action": scaled_action,
         "ask_fill": ask_fill,
+        "ask_execution_price": ask_execution_price,
         "ask_price": ask_price,
         "ask_size": ask_size,
         "bid_fill": bid_fill,
+        "bid_execution_price": bid_execution_price,
         "bid_price": bid_price,
         "bid_size": bid_size,
-        "buy_market": buy_market.astype(jnp.float32),
         "cash_after": next_cash,
         "cash_after_trade": cash_after_trade,
         "cash_before": cash_before,
@@ -268,15 +259,15 @@ def env_step(
         "next_global_index": next_global_index,
         "next_index": next_global_index,
         "next_step_index": next_step_index,
-        "no_quotes": no_quotes.astype(jnp.float32),
+        "normalized_action": normalized_action,
         "pnl": pnl,
-        "pnl_vol_scaled": pnl / (current_atr + reward_epsilon),
         "portfolio_value_after": portfolio_value_after,
         "portfolio_value_before": portfolio_value_before,
         "raw_quote_size": raw_quote_size,
+        "reservation_price": reservation_price,
         "return": step_return,
-        "sell_market": sell_market.astype(jnp.float32),
         "session_end": session_end,
+        "spread": spread,
         "valid_transition": valid_transition,
     }
     return next_observation, next_state, reward, done, info

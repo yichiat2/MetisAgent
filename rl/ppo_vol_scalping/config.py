@@ -9,16 +9,16 @@ class DataConfig:
     root: str = "NVDA"
     start_date: int = 20200101
     end_date: int = 20251231
-    train_window_bars: int = 150_000
-    inference_window_bars: int = 50_000
-    fold_stride_bars: int = 50_000
+    train_window_bars: int = 200_000
+    inference_window_bars: int = 100_000
+    fold_stride_bars: int = 100_000
 
 
 @dataclass(frozen=True)
 class FeatureConfig:
     fast_ema_length: int = 8
     slow_ema_length: int = 30
-    atr_length: int = 8
+    atr_length: int = 14
     directional_atr_ema_length: int = 5
     srvi_length: int = 9
     epsilon: float = 1e-8
@@ -30,38 +30,48 @@ class EnvironmentConfig:
     episode_stride: int = 32
     max_inventory: int = 100
     flatten_at_session_end: bool = True
-    price_action_levels: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0)
     quote_size_shares: float = 100.0
+    action_low: tuple[float, ...] = (-2.0, 0.0)
+    action_high: tuple[float, ...] = (2.0, 4.0)
+
+    def __post_init__(self) -> None:
+        if len(self.action_low) != len(self.action_high):
+            raise ValueError("Environment action_low and action_high lengths must match")
+        if any(high <= low for low, high in zip(self.action_low, self.action_high, strict=True)):
+            raise ValueError("Each environment action_high entry must exceed the corresponding action_low entry")
 
 
 @dataclass(frozen=True)
 class RewardConfig:
-    damped_pnl_eta: float = 0.15
-    inventory_penalty_eta: float = 0.0
+    damped_pnl_eta: float = 0.25
+    inventory_penalty_eta: float = 0.01
     reward_epsilon: float = 1e-8
 
 
 @dataclass(frozen=True)
 class PPOConfig:
-    actor_learning_rate: float = 1e-5
-    critic_learning_rate: float = 1e-5
-    discount: float = 1.0
+    actor_learning_rate: float = 1e-4
+    critic_learning_rate: float = 1e-4
+    discount: float = 0.99
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
     entropy_coefficient: float = 0.01
     actor_l1: float = 0.
     critic_l1: float = 0.
-    minibatch_size: int = 64
-    num_env: int = 32
+    minibatch_size: int = 256
+    num_env: int = 256
     num_update: int = 20
-    epochs: int = 5
+    epochs: int = 10
 
 
 @dataclass(frozen=True)
 class ModelConfig:
     hidden_sizes: tuple[int, ...] = (8, 8)
     action_dim: int = 2
-    action_cardinality: int = 4
+
+    def __post_init__(self) -> None:
+        if self.action_dim <= 0:
+            raise ValueError("Model action_dim must be positive")
 
 
 @dataclass(frozen=True)
@@ -94,6 +104,10 @@ class PPOVolScalpingConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+
+    def __post_init__(self) -> None:
+        if self.model.action_dim != len(self.environment.action_low):
+            raise ValueError("Model action_dim must match the number of environment action bounds")
 
 
 def make_default_config() -> PPOVolScalpingConfig:

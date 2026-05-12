@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-
 import distrax
 import flax.linen as nn
 from flax.linen.initializers import constant, orthogonal
@@ -17,37 +15,36 @@ from .contracts import ACTOR_STATE_DIM, CRITIC_STATE_DIM
 
 def sample_and_log_prob(
     rng: jax.Array,
-    dist: distrax.Categorical,
+    dist: distrax.Beta,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     action = dist.sample(seed=rng)
     log_prob = get_log_prob(dist, action)
     return action, log_prob
 
 
-def deterministic_action(dist: distrax.Categorical) -> jnp.ndarray:
-    return dist.mode()
+def deterministic_action(dist: distrax.Beta) -> jnp.ndarray:
+    return dist.mean()
 
 
-def get_log_prob(dist: distrax.Categorical, action: jnp.ndarray) -> jnp.ndarray:
-    action = jnp.asarray(action, dtype=jnp.int32)
-    log_prob = dist.log_prob(action)
-    log_prob = jnp.sum(log_prob, axis=-1)
-    return log_prob
+def get_log_prob(dist: distrax.Beta, action: jnp.ndarray) -> jnp.ndarray:
+    action = jnp.asarray(action)
+    eps = jnp.asarray(1e-6, dtype=action.dtype)
+    within_support = jnp.all((action >= 0.0) & (action <= 1.0), axis=-1)
+    action = jnp.clip(action, eps, 1.0 - eps)
+    log_prob = jnp.sum(dist.log_prob(action), axis=-1)
+    return jnp.where(within_support, log_prob, -jnp.inf)
 
 
-def get_entropy(dist: distrax.Categorical) -> jnp.ndarray:
-    entropy = dist.entropy()
-    entropy = jnp.sum(entropy, axis=-1)
-    return entropy
+def get_entropy(dist: distrax.Beta) -> jnp.ndarray:
+    return jnp.sum(dist.entropy(), axis=-1)
 
 
 class Actor(nn.Module):
     hidden_sizes: tuple[int, ...] = (64, 64)
     action_dim: int = 2
-    action_cardinality: int = 4
 
     @nn.compact
-    def __call__(self, state: jnp.ndarray) -> distrax.Distribution:
+    def __call__(self, state: jnp.ndarray) -> distrax.Beta:
         activation = lambda x: nn.leaky_relu(x, negative_slope=0.01)
         hidden = state
         for width in self.hidden_sizes:
@@ -57,14 +54,20 @@ class Actor(nn.Module):
                 bias_init=constant(0.0),
             )(hidden)
             hidden = activation(hidden)
-        logits = nn.Dense(
-            self.action_dim * self.action_cardinality,
+
+        alpha_logits = nn.Dense(
+            self.action_dim,
             kernel_init=orthogonal(0.01),
             bias_init=constant(0.0),
         )(hidden)
-        logits = logits.reshape(logits.shape[:-1] + (self.action_dim, self.action_cardinality))
-        dist = distrax.Categorical(logits=logits)
-        return dist
+        beta_logits = nn.Dense(
+            self.action_dim,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0),
+        )(hidden)
+        alpha = jax.nn.softplus(alpha_logits) + 1.0
+        beta = jax.nn.softplus(beta_logits) + 1.0
+        return distrax.Beta(alpha=alpha, beta=beta)
 
 
 class Critic(nn.Module):
@@ -99,7 +102,6 @@ def create_train_states(
     actor = Actor(
         hidden_sizes=config.model.hidden_sizes,
         action_dim=config.model.action_dim,
-        action_cardinality=config.model.action_cardinality,
     )
     critic = Critic(hidden_sizes=config.model.hidden_sizes)
 

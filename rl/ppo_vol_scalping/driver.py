@@ -197,8 +197,10 @@ def run_fold_inference(
             "inventory": info["inventory_after"],
             "pnl": info["pnl"],
             "portfolio_value": info["portfolio_value_after"],
+            "reservation_price": info["reservation_price"],
             "reward": reward,
             "return": info["return"],
+            "spread": info["spread"],
         }
         return (next_obs, next_state), step_info
 
@@ -350,14 +352,17 @@ def run_fold_update(
                     actor_loss = -jnp.minimum(loss1, loss2).mean()
                     entropy = get_entropy(dist).mean()
                     total = actor_loss - config.ppo.entropy_coefficient * entropy
-                    return total, (actor_loss, entropy)
+                    ratio_mean = jnp.mean(ratio)
+                    ratio_min = jnp.min(ratio)
+                    ratio_max = jnp.max(ratio)
+                    return total, (actor_loss, entropy, ratio_mean, ratio_min, ratio_max)
 
                 def _critic_loss(critic_params):
                     value = critic_state.apply_fn({"params": critic_params}, traj.obs.critic)
                     vf_loss = 0.5 * jnp.square(value - tgt).mean()
                     return vf_loss, vf_loss
 
-                (actor_total, (actor_loss, entropy)), actor_grads = jax.value_and_grad(
+                (actor_total, (actor_loss, entropy, ratio_mean, ratio_min, ratio_max)), actor_grads = jax.value_and_grad(
                     _actor_loss, has_aux=True
                 )(actor_state.params)
                 (critic_total, _), critic_grads = jax.value_and_grad(
@@ -379,7 +384,15 @@ def run_fold_update(
 
                 actor_state = actor_state.apply_gradients(grads=actor_grads)
                 critic_state = critic_state.apply_gradients(grads=critic_grads)
-                loss_info = (actor_total, critic_total, actor_loss, entropy)
+                loss_info = (
+                    actor_total,
+                    critic_total,
+                    actor_loss,
+                    entropy,
+                    ratio_mean,
+                    ratio_min,
+                    ratio_max,
+                )
                 return (actor_state, critic_state), loss_info
 
             (actor_state, critic_state), loss_info = jax.lax.scan(
@@ -408,17 +421,21 @@ def run_fold_update(
         run_indices,
     )
 
-    _, critic_losses, actor_losses, entropies = run_loss_info
+    _, critic_losses, actor_losses, entropies, ratio_means, ratio_mins, ratio_maxs = run_loss_info
     run_episode_rewards, run_avg_max_drawdown = run_metrics
     avg_actor_loss_per_epoch = jnp.mean(actor_losses, axis=-1)
     avg_critic_loss_per_epoch = jnp.mean(critic_losses, axis=-1)
     avg_entropy_per_epoch = jnp.mean(entropies, axis=-1)
+    avg_ratio_per_epoch = jnp.mean(ratio_means, axis=-1)
     training_metrics = {
         "avg_actor_loss": jnp.mean(avg_actor_loss_per_epoch[:, -1]),
         "avg_critic_loss": jnp.mean(avg_critic_loss_per_epoch[:, -1]),
         "avg_episode_reward": jnp.mean(run_episode_rewards),
         "avg_entropy": jnp.mean(avg_entropy_per_epoch[:, -1]),
         "avg_episode_max_drawdown": jnp.mean(run_avg_max_drawdown),
+        "avg_ratio": jnp.mean(avg_ratio_per_epoch[:, -1]),
+        "min_ratio": jnp.min(ratio_mins[:, -1]),
+        "max_ratio": jnp.max(ratio_maxs[:, -1]),
     }
 
     return actor_state, critic_state, rng, training_metrics
@@ -503,6 +520,9 @@ def train(
                 f"[train] actor loss: {float(training_metrics_host['avg_actor_loss']):.6f}, "
                 f"critic loss: {float(training_metrics_host['avg_critic_loss']):.6f}, "
                 f"entropy: {float(training_metrics_host['avg_entropy']):.6f}, "
+                f"ratio mean/min/max: {float(training_metrics_host['avg_ratio']):.6f}/"
+                f"{float(training_metrics_host['min_ratio']):.6f}/"
+                f"{float(training_metrics_host['max_ratio']):.6f}, "
                 f"episode reward: {float(training_metrics_host['avg_episode_reward']):.6f}, "
                 f"episode max drawdown: {float(training_metrics_host['avg_episode_max_drawdown']):.6f}"
             )
