@@ -48,7 +48,7 @@ STATIC_FEATURE_NAMES = (
     "atr_over_close_milli",
     # "srvi",
     "atr_imbalance",
-    # "vslope",
+    "vslope",
     # "vmacd",
     # "vmacd_slope",
 )

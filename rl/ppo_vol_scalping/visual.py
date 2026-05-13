@@ -5,6 +5,8 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from .contracts import STATIC_FEATURE_NAMES
+
 
 DEFAULT_DASH_PORT = 8051
 
@@ -15,11 +17,14 @@ _state: dict[str, Any] = {
 
 _server_started = False
 _server_lock = threading.Lock()
+ATR_OVER_CLOSE_MILLI_INDEX = STATIC_FEATURE_NAMES.index("atr_over_close_milli")
+ATR_IMBALANCE_INDEX = STATIC_FEATURE_NAMES.index("atr_imbalance")
 
 
 def prepare_inference_payload(
     metrics: Mapping[str, Any],
     ohlc: Any,
+    static_features: Any,
     fold_id: int,
     update_step: int,
     num_updates: int,
@@ -28,8 +33,11 @@ def prepare_inference_payload(
         key: _normalize_metric_value(value) for key, value in metrics.items()
     }
     aligned_ohlc = np.asarray(ohlc, dtype=np.float32)
+    aligned_static_features = np.asarray(static_features, dtype=np.float32)
     if aligned_ohlc.ndim != 2 or aligned_ohlc.shape[1] < 4:
         raise ValueError("Expected OHLC input with shape (num_bars, 4)")
+    if aligned_static_features.ndim != 2:
+        raise ValueError("Expected static_features input with shape (num_bars, num_features)")
 
     bid_price = np.asarray(host_metrics["bid_price"], dtype=np.float32)
     ask_price = np.asarray(host_metrics["ask_price"], dtype=np.float32)
@@ -38,6 +46,14 @@ def prepare_inference_payload(
         raise ValueError("Bid and ask price series must have the same length")
     if aligned_ohlc.shape[0] != num_steps + 1:
         raise ValueError("Expected one extra OHLC bar so prices at t align with OHLC at t + 1")
+    if aligned_static_features.shape[0] != num_steps + 1:
+        raise ValueError(
+            "Expected one extra static feature row so values at t align with the inference horizon"
+        )
+    if aligned_static_features.shape[1] <= ATR_OVER_CLOSE_MILLI_INDEX:
+        raise ValueError("Static features are missing atr_over_close_milli")
+    if aligned_static_features.shape[1] <= ATR_IMBALANCE_INDEX:
+        raise ValueError("Static features are missing atr_imbalance")
 
     actions = np.asarray(host_metrics["actions"], dtype=np.int32)
     if actions.shape[0] != num_steps:
@@ -45,6 +61,8 @@ def prepare_inference_payload(
 
     reservation_price = np.asarray(host_metrics["reservation_price"], dtype=np.float32)
     spread = np.asarray(host_metrics["spread"], dtype=np.float32)
+    atr_over_ema = aligned_static_features[:num_steps, ATR_OVER_CLOSE_MILLI_INDEX] / 1000.0
+    atr_imbalance = aligned_static_features[:num_steps, ATR_IMBALANCE_INDEX]
 
     return {
         "fold_id": int(fold_id),
@@ -61,6 +79,8 @@ def prepare_inference_payload(
         "ohlc": aligned_ohlc[1:, :4],
         "reservation_price": reservation_price,
         "spread": spread,
+        "atr_imbalance": atr_imbalance,
+        "atr_over_ema": atr_over_ema,
         "bid_price": bid_price,
         "ask_price": ask_price,
         "inventory": np.asarray(host_metrics["inventory"], dtype=np.float32),
@@ -112,7 +132,7 @@ def _build_app():
         children=[
             html.H2("PPO Vol Scalping Dashboard"),
             html.Div(id="stats-bar", style={"marginBottom": "10px", "fontWeight": "bold"}),
-            dcc.Graph(id="inference-plot", style={"height": "1080px"}),
+            dcc.Graph(id="inference-plot", style={"height": "1240px"}),
             dcc.Interval(id="interval", interval=2_000, n_intervals=0),
         ],
     )
@@ -145,23 +165,31 @@ def build_inference_figure(payload: Mapping[str, Any]):
     inventory = np.asarray(payload["inventory"], dtype=np.float32)
     pnl = np.asarray(payload["pnl"], dtype=np.float32)
     cumulative_pnl = np.asarray(payload["cumulative_pnl"], dtype=np.float32)
+    atr_imbalance = np.asarray(payload["atr_imbalance"], dtype=np.float32)
+    atr_over_ema = np.asarray(payload["atr_over_ema"], dtype=np.float32)
     actions = np.asarray(payload["actions"], dtype=np.float32)
     timestep = np.arange(ohlc.shape[0], dtype=np.int32)
+    if atr_imbalance.shape[0] != timestep.shape[0]:
+        raise ValueError("Expected ATR imbalance series to align with the inference horizon")
+    if atr_over_ema.shape[0] != timestep.shape[0]:
+        raise ValueError("Expected ATR / EMA series to align with the inference horizon")
 
     fig = make_subplots(
-        rows=3,
+        rows=4,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.04,
-        row_heights=[0.46, 0.27, 0.27],
+        row_heights=[0.42, 0.22, 0.14, 0.22],
         specs=[
             [{"secondary_y": True}],
             [{"secondary_y": True}],
+            [{}],
             [{"secondary_y": True}],
         ],
         subplot_titles=(
             "OHLC (t + 1) with reservation price and bid/ask quotes (t)",
-            "Cumulative PnL and step PnL",
+            "Cumulative PnL, step PnL, and ATR imbalance",
+            "ATR / EMA(close) at t",
             "A1 inventory skew and A2 spread multiplier",
         ),
     )
@@ -254,6 +282,30 @@ def build_inference_figure(payload: Mapping[str, Any]):
         col=1,
         secondary_y=True,
     )
+    fig.add_trace(
+        go.Scatter(
+            x=timestep,
+            y=atr_imbalance,
+            mode="lines",
+            name="ATR imbalance t",
+            line={"color": "#7c3aed", "width": 1.4},
+        ),
+        row=2,
+        col=1,
+        secondary_y=True,
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=timestep,
+            y=atr_over_ema,
+            mode="lines",
+            name="ATR / EMA(close) t",
+            line={"color": "#0f766e", "width": 1.6},
+        ),
+        row=3,
+        col=1,
+    )
 
     action_names = ("A1 inventory skew", "A2 spread multiplier")
     action_colors = ("#2563eb", "#dc2626")
@@ -269,7 +321,7 @@ def build_inference_figure(payload: Mapping[str, Any]):
                 line={"color": color, "width": 1.4, "shape": "hv"},
                 marker={"size": 5},
             ),
-            row=3,
+            row=4,
             col=1,
             secondary_y=bool(index),
         )
@@ -277,13 +329,14 @@ def build_inference_figure(payload: Mapping[str, Any]):
     fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="Inventory", row=1, col=1, secondary_y=True)
     fig.update_yaxes(title_text="Cumulative PnL", row=2, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="Step PnL", row=2, col=1, secondary_y=True)
-    fig.update_yaxes(title_text="A1 inventory skew", row=3, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="A2 spread multiplier", row=3, col=1, secondary_y=True)
-    fig.update_xaxes(title_text="Timestep", row=3, col=1)
+    fig.update_yaxes(title_text="Step PnL / ATR imbalance", row=2, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="ATR / EMA(close)", row=3, col=1)
+    fig.update_yaxes(title_text="A1 inventory skew", row=4, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="A2 spread multiplier", row=4, col=1, secondary_y=True)
+    fig.update_xaxes(title_text="Timestep", row=4, col=1)
     fig.update_layout(
         template="plotly_white",
-        height=1080,
+        height=1240,
         hovermode="x unified",
         bargap=0.05,
         margin={"t": 70, "b": 40, "l": 60, "r": 60},

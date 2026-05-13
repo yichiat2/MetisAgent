@@ -201,12 +201,11 @@ def env_step(
     )
 
     log_ret = jnp.log(portfolio_value_after_mark / portfolio_value_before) * 100
-    damped_log_ret = log_ret - damped_pnl_eta * jnp.maximum(0.0, log_ret)
+    damped_log_ret = log_ret - damped_pnl_eta * jnp.maximum(0.0, -log_ret)
 
     # damped_log_ret = log_ret - damped_pnl_eta * jnp.square(jnp.minimum(0.0, log_ret))
+    damped_pnl = pnl - damped_pnl_eta * jnp.maximum(0.0, pnl)
 
-
-    damped_pnl = pnl - damped_pnl_eta * jnp.square(jnp.maximum(0.0, pnl))
     flattened_cash = cash_after_trade + inventory_after_trade * current_close
     next_cash = jnp.where(should_flatten, flattened_cash, cash_after_trade)
     next_inventory = jnp.where(should_flatten, 0., inventory_after_trade)

@@ -123,7 +123,7 @@ def build_preprocessed_arrays(raw_bars_df: pd.DataFrame, feature_config: Feature
             atr_over_close_milli,
             # srvi,
             atr_imbalance,
-            # vslope,
+            vslope,
             # vmacd,
             # vmacd_slope,
         ]

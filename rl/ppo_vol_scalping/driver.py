@@ -509,6 +509,7 @@ def train(
                     prepare_inference_payload(
                         metrics=infer_metrics_host,
                         ohlc=infer_arrays.ohlc,
+                        static_features=infer_arrays.static_features,
                         fold_id=fold.fold_id,
                         update_step=update_step + 1,
                         num_updates=config.ppo.num_update,
