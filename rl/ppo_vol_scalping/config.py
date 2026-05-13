@@ -6,7 +6,7 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class DataConfig:
-    root: str = "NVDA"
+    root: str = "MSFT"
     start_date: int = 20200101
     end_date: int = 20251231
     train_window_bars: int = 200_000
@@ -18,7 +18,7 @@ class DataConfig:
 class FeatureConfig:
     fast_ema_length: int = 8
     slow_ema_length: int = 30
-    atr_length: int = 14
+    atr_length: int = 8
     directional_atr_ema_length: int = 5
     srvi_length: int = 9
     epsilon: float = 1e-8
@@ -28,7 +28,7 @@ class FeatureConfig:
 class EnvironmentConfig:
     episode_length: int = 32
     episode_stride: int = 32
-    max_inventory: int = 100
+    max_inventory: int = 500
     flatten_at_session_end: bool = True
     quote_size_shares: float = 100.0
     action_low: tuple[float, ...] = (-2.0, 0.0)
@@ -51,7 +51,8 @@ class RewardConfig:
 @dataclass(frozen=True)
 class PPOConfig:
     actor_learning_rate: float = 1e-4
-    critic_learning_rate: float = 1e-4
+    critic_learning_rate: float = 3e-5
+    min_learning_rate: float = 1e-6
     discount: float = 0.99
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
@@ -62,6 +63,16 @@ class PPOConfig:
     num_env: int = 256
     num_update: int = 20
     epochs: int = 10
+
+    def __post_init__(self) -> None:
+        if self.actor_learning_rate <= 0.0 or self.critic_learning_rate <= 0.0:
+            raise ValueError("PPO learning rates must be positive")
+        if self.min_learning_rate <= 0.0:
+            raise ValueError("PPO min_learning_rate must be positive")
+        if self.min_learning_rate > self.actor_learning_rate:
+            raise ValueError("PPO min_learning_rate cannot exceed actor_learning_rate")
+        if self.min_learning_rate > self.critic_learning_rate:
+            raise ValueError("PPO min_learning_rate cannot exceed critic_learning_rate")
 
 
 @dataclass(frozen=True)

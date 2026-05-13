@@ -13,6 +13,38 @@ from .config import PPOVolScalpingConfig
 from .contracts import ACTOR_STATE_DIM, CRITIC_STATE_DIM
 
 
+def _build_learning_rate_schedule(
+    init_value: float,
+    config: PPOVolScalpingConfig,
+) -> optax.Schedule:
+    effective_train_window = config.data.train_window_bars - 1
+    max_start = effective_train_window - config.environment.episode_length
+    if max_start < 0:
+        raise ValueError("Episode length cannot exceed the effective training window")
+
+    batch_size = config.environment.episode_length * config.ppo.num_env
+    if batch_size % config.ppo.minibatch_size != 0:
+        raise ValueError("PPO minibatch_size must evenly divide episode_length * num_env")
+
+    training_episodes = max_start // config.environment.episode_stride + 1
+    run_steps = training_episodes // config.ppo.num_env
+    if run_steps <= 0:
+        raise ValueError("PPO num_env exceeds the available training episodes per fold")
+
+    total_training_steps = (
+        config.ppo.num_update
+        * run_steps
+        * batch_size
+        * config.ppo.epochs
+        // config.ppo.minibatch_size
+    )
+    return optax.cosine_decay_schedule(
+        init_value=init_value,
+        decay_steps=total_training_steps,
+        alpha=config.ppo.min_learning_rate / init_value,
+    )
+
+
 def sample_and_log_prob(
     rng: jax.Array,
     dist: distrax.Beta,
@@ -109,8 +141,12 @@ def create_train_states(
     actor_params = actor.init(actor_rng, dummy_actor_state)["params"]
     critic_params = critic.init(critic_rng, dummy_critic_state)["params"]
 
-    actor_tx = optax.adam(learning_rate=config.ppo.actor_learning_rate)
-    critic_tx = optax.adam(learning_rate=config.ppo.critic_learning_rate)
+    actor_tx = optax.adam(
+        learning_rate=_build_learning_rate_schedule(config.ppo.actor_learning_rate, config)
+    )
+    critic_tx = optax.adam(
+        learning_rate=_build_learning_rate_schedule(config.ppo.critic_learning_rate, config)
+    )
 
     actor_state = TrainState.create(
         apply_fn=actor.apply,

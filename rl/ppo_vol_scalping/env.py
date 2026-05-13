@@ -153,7 +153,6 @@ def env_step(
     bid_price = reservation_price - 0.5 * spread
     ask_price = reservation_price + 0.5 * spread
 
-
     max_inventory = env_param.max_inventory
     raw_quote_size = env_param.quote_size_shares
     bid_size = jnp.minimum(
@@ -203,6 +202,9 @@ def env_step(
 
     log_ret = jnp.log(portfolio_value_after_mark / portfolio_value_before) * 100
     damped_log_ret = log_ret - damped_pnl_eta * jnp.maximum(0.0, log_ret)
+
+    # damped_log_ret = log_ret - damped_pnl_eta * jnp.square(jnp.minimum(0.0, log_ret))
+
 
     damped_pnl = pnl - damped_pnl_eta * jnp.square(jnp.maximum(0.0, pnl))
     flattened_cash = cash_after_trade + inventory_after_trade * current_close

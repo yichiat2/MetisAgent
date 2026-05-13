@@ -476,8 +476,7 @@ def train(
         print(f"  Number of training episodes: {len(episode_start_indices)}")
         print(f"  Number of runs per update: {len(episode_start_indices) // config.ppo.num_env}")
         print(f"  Number of minibatches per run: {(config.environment.episode_length * config.ppo.num_env) // config.ppo.minibatch_size}    ")
-        print(f"  Number of timesteps per update: {(len(episode_start_indices) // config.ppo.num_env) * config.ppo.num_env}")
-        
+     
         env_param = build_env_param(config, train_arrays)
         infer_env_param = build_env_param(config, infer_arrays)
 
