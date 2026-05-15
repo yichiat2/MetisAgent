@@ -11,26 +11,6 @@ from data.database import Database
 if TYPE_CHECKING:
     from .config import DataConfig, FeatureConfig
 
-
-def _ema(values: np.ndarray, length: int) -> np.ndarray:
-    return pd.Series(values, copy=False).ewm(span=length, adjust=False).mean().to_numpy(dtype=np.float64)
-
-
-def _rma(values: np.ndarray, length: int) -> np.ndarray:
-    return pd.Series(values, copy=False).ewm(alpha=1.0 / length, adjust=False).mean().to_numpy(dtype=np.float64)
-
-
-def _rolling_sum(values: np.ndarray, window: int) -> np.ndarray:
-    return pd.Series(values, copy=False).rolling(window=window, min_periods=1).sum().to_numpy(dtype=np.float64)
-
-
-def _episode_start_indices(train_window_bars: int, episode_length: int, episode_stride: int) -> np.ndarray:
-    train_window_bars = train_window_bars - 1 # The effective training window is one bar shorter than the nominal length. The last bar is used as the "next observation" for the final step of the final episode.
-    max_start = train_window_bars - episode_length
-    assert max_start >= 0, "Episode length is greater than training window."
-    return np.arange(0, max_start + 1, episode_stride, dtype=np.int32)
-
-
 def load_raw_bars_dataframe(data_config: DataConfig) -> pd.DataFrame:
     database = Database()
 
@@ -80,12 +60,6 @@ def build_preprocessed_arrays(raw_bars_df: pd.DataFrame, feature_config: Feature
     prev_close = np.empty_like(close)
     prev_close[0] = close[0] if close.size else 0.0
     prev_close[1:] = close[:-1]
-    log_return = np.zeros_like(close)
-    log_return[1:] = np.log(close[1:] / prev_close[1:])
-
-    variance_proxy = np.square(log_return)
-    ema_fast = _ema(close, feature_config.fast_ema_length)
-    ema_slow = _ema(close, feature_config.slow_ema_length)
 
     true_range = np.maximum.reduce(
         [
@@ -94,61 +68,61 @@ def build_preprocessed_arrays(raw_bars_df: pd.DataFrame, feature_config: Feature
             np.abs(low - prev_close),
         ]
     )
-    atr = _ema(true_range, feature_config.atr_length)
-    ema_atr_close = _ema(close, feature_config.atr_length)
+    atr = pd.Series(true_range, copy=False).ewm(
+        alpha=1.0 / feature_config.atr_length,
+        adjust=False,
+    ).mean().to_numpy(dtype=np.float64)
+    close_ema = pd.Series(close, copy=False).ewm(
+        span=feature_config.atr_over_ema_length,
+        adjust=False,
+    ).mean().to_numpy(dtype=np.float64)
 
     close_delta = close - prev_close
     directional_true_range_up = np.where(close_delta > 0.0, true_range, 0.0)
     directional_true_range_down = np.where(close_delta < 0.0, true_range, 0.0)
-    atr_up = _ema(directional_true_range_up, feature_config.directional_atr_ema_length)
-    atr_down = _ema(directional_true_range_down, feature_config.directional_atr_ema_length)
+    atr_up = pd.Series(directional_true_range_up, copy=False).ewm(
+        span=feature_config.directional_atr_ema_length,
+        adjust=False,
+    ).mean().to_numpy(dtype=np.float64)
+    atr_down = pd.Series(directional_true_range_down, copy=False).ewm(
+        span=feature_config.directional_atr_ema_length,
+        adjust=False,
+    ).mean().to_numpy(dtype=np.float64)
     atr_imbalance = (atr_up - atr_down) / np.maximum(atr, feature_config.epsilon)
-
-    signed_variance = variance_proxy * np.sign(log_return)
-    srvi_num = _rolling_sum(signed_variance, feature_config.srvi_length)
-    srvi_den = _rolling_sum(variance_proxy, feature_config.srvi_length)
-    srvi = srvi_num / np.maximum(srvi_den, feature_config.epsilon)
-    atr_over_close_milli = atr / np.maximum(ema_atr_close, feature_config.epsilon) * 1000.0
-    vslope = np.zeros_like(close)
-    vslope[1:] = (ema_slow[1:] - ema_slow[:-1]) / (atr[1:] + feature_config.epsilon)
-
-    vmacd = (ema_fast - ema_slow) / (atr + feature_config.epsilon)
-    vmacd_slope = np.zeros_like(close)
-    vmacd_slope[1:] = vmacd[1:] - vmacd[:-1]
-
-    static_features = np.column_stack(
-        [
-            # raw_bars_df["tau"].to_numpy(dtype=np.float64),
-            # log_return,
-            atr_over_close_milli,
-            # srvi,
-            atr_imbalance,
-            vslope,
-            # vmacd,
-            # vmacd_slope,
-        ]
-    )
+    atr_over_ema = atr / np.maximum(close_ema, feature_config.epsilon)
 
     ohlc = np.column_stack([open_, high, low, close])
 
-    static_features = np.ascontiguousarray(static_features.astype(np.float32))
     ohlc = np.ascontiguousarray(ohlc.astype(np.float32))
     atr = np.ascontiguousarray(atr.astype(np.float32))
+    atr_up = np.ascontiguousarray(atr_up.astype(np.float32))
+    atr_down = np.ascontiguousarray(atr_down.astype(np.float32))
+    atr_imbalance = np.ascontiguousarray(atr_imbalance.astype(np.float32))
+    atr_over_ema = np.ascontiguousarray(atr_over_ema.astype(np.float32))
     day_ids = np.ascontiguousarray(raw_bars_df["day_id"].to_numpy(dtype=np.int32))
     bar_in_day = np.ascontiguousarray(raw_bars_df["bar_in_day"].to_numpy(dtype=np.int32))
     session_end_mask = np.ascontiguousarray(raw_bars_df["is_session_end"].to_numpy(dtype=bool))
 
-    if not np.isfinite(static_features).all():
-        raise ValueError("Feature preprocessing produced non-finite values")
     if not np.isfinite(ohlc).all():
         raise ValueError("OHLC preprocessing produced non-finite values")
     if not np.isfinite(atr).all():
         raise ValueError("ATR preprocessing produced non-finite values")
+    if not np.isfinite(atr_up).all():
+        raise ValueError("ATR up preprocessing produced non-finite values")
+    if not np.isfinite(atr_down).all():
+        raise ValueError("ATR down preprocessing produced non-finite values")
+    if not np.isfinite(atr_imbalance).all():
+        raise ValueError("ATR imbalance preprocessing produced non-finite values")
+    if not np.isfinite(atr_over_ema).all():
+        raise ValueError("ATR over EMA preprocessing produced non-finite values")
 
     return PreprocessedArrays(
         ohlc=ohlc,
-        static_features=static_features,
         atr=atr,
+        atr_up=atr_up,
+        atr_down=atr_down,
+        atr_imbalance=atr_imbalance,
+        atr_over_ema=atr_over_ema,
         day_ids=day_ids,
         bar_in_day=bar_in_day,
         session_end_mask=session_end_mask,
@@ -160,8 +134,6 @@ def build_walk_forward_folds(
     train_window_bars: int,
     inference_window_bars: int,
     fold_stride_bars: int,
-    episode_length: int,
-    episode_stride: int,
 ) -> list[Fold]:
     num_bars = preprocessed_arrays.num_bars
     full_window = train_window_bars + inference_window_bars
@@ -179,11 +151,6 @@ def build_walk_forward_folds(
                 train_end=train_end,
                 inference_start=inference_start,
                 inference_end=inference_end,
-                episode_start_indices=_episode_start_indices(
-                    train_window_bars=train_window_bars,
-                    episode_length=episode_length,
-                    episode_stride=episode_stride,
-                ),
             )
         )
 

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, NamedTuple
-import jax.numpy as jnp
+from typing import Any
+
+from flax import struct
 
 RAW_BAR_INPUT_COLUMNS = (
     "date",
@@ -43,32 +44,19 @@ BAR_COLUMNS = (
 )
 
 STATIC_FEATURE_NAMES = (
-    # "tau",
-    # "log_return",
-    "atr_over_close_milli",
-    # "srvi",
+    "atr_over_ema",
     "atr_imbalance",
-    "vslope",
-    # "vmacd",
-    # "vmacd_slope",
 )
-
-STATIC_FEATURE_DIM = len(STATIC_FEATURE_NAMES)
-ACTOR_STATE_DIM = STATIC_FEATURE_DIM + 1
-CRITIC_STATE_DIM = ACTOR_STATE_DIM + 1
-STATE_DIM = ACTOR_STATE_DIM
-
-
-class Observation(NamedTuple):
-    actor: jnp.ndarray
-    critic: jnp.ndarray
 
 
 @dataclass(frozen=True)
 class PreprocessedArrays:
     ohlc: Any
-    static_features: Any
     atr: Any
+    atr_up: Any
+    atr_down: Any
+    atr_imbalance: Any
+    atr_over_ema: Any
     day_ids: Any
     bar_in_day: Any
     session_end_mask: Any
@@ -80,12 +68,16 @@ class PreprocessedArrays:
     def __getitem__(self, idx):
         return PreprocessedArrays(
             ohlc=self.ohlc[idx],
-            static_features=self.static_features[idx],
             atr=self.atr[idx],
+            atr_up=self.atr_up[idx],
+            atr_down=self.atr_down[idx],
+            atr_imbalance=self.atr_imbalance[idx],
+            atr_over_ema=self.atr_over_ema[idx],
             day_ids=self.day_ids[idx],
             bar_in_day=self.bar_in_day[idx],
             session_end_mask=self.session_end_mask[idx],
         )
+
 
 @dataclass(frozen=True)
 class Fold:
@@ -94,7 +86,6 @@ class Fold:
     train_end: int
     inference_start: int
     inference_end: int
-    episode_start_indices: Any
 
     @property
     def train_length(self) -> int:
@@ -116,11 +107,15 @@ class Fold:
     def validation_length(self) -> int:
         return self.inference_length
 
-class Transition(NamedTuple):
-    done: jnp.ndarray
-    action: jnp.ndarray
-    value: jnp.ndarray
-    reward: jnp.ndarray
-    log_prob: jnp.ndarray
-    obs: Observation
-    info: jnp.ndarray
+
+@struct.dataclass
+class StrategyGrid:
+    k_init: Any
+    a_tp: Any
+    k_act: Any
+    entry_short: Any
+    entry_long: Any
+
+    @property
+    def size(self) -> int:
+        return int(self.k_init.shape[0])

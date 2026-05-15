@@ -4,104 +4,125 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def make_grid_axis(start: float, stop: float, step: float) -> tuple[float, ...]:
+    num_steps = int(round((stop - start) / step))
+    return tuple(round(start + step * index, 10) for index in range(num_steps))
+
+
+def make_grid_axis_inclusive(start: float, stop: float, step: float) -> tuple[float, ...]:
+    num_steps = int(round((stop - start) / step)) + 1
+    return tuple(round(start + step * index, 10) for index in range(num_steps))
+
+
 @dataclass(frozen=True)
 class DataConfig:
-    root: str = "MSFT"
+    root: str = "NVDA"
     start_date: int = 20200101
     end_date: int = 20251231
-    train_window_bars: int = 200_000
-    inference_window_bars: int = 100_000
-    fold_stride_bars: int = 100_000
+    train_window_bars: int = 80_000
+    inference_window_bars: int = 40_000
+    fold_stride_bars: int = 40_000
 
 
 @dataclass(frozen=True)
 class FeatureConfig:
-    fast_ema_length: int = 8
-    slow_ema_length: int = 30
+    atr_over_ema_length: int = 10
     atr_length: int = 8
     directional_atr_ema_length: int = 5
-    srvi_length: int = 9
     epsilon: float = 1e-8
+
+    def __post_init__(self) -> None:
+        if self.atr_length <= 0:
+            raise ValueError("Feature atr_length must be positive")
+        if self.atr_over_ema_length <= 0:
+            raise ValueError("Feature atr_over_ema_length must be positive")
+        if self.directional_atr_ema_length <= 0:
+            raise ValueError("Feature directional_atr_ema_length must be positive")
+        if self.epsilon <= 0.0:
+            raise ValueError("Feature epsilon must be positive")
 
 
 @dataclass(frozen=True)
 class EnvironmentConfig:
-    episode_length: int = 32
-    episode_stride: int = 32
-    max_inventory: int = 500
-    flatten_at_session_end: bool = True
     quote_size_shares: float = 100.0
-    action_low: tuple[float, ...] = (-2.0, 0.0)
-    action_high: tuple[float, ...] = (2.0, 4.0)
+    ibkr_monthly_volume_shares: float = 0.0
+    ibkr_commission_min_per_order: float = 0.35
+    ibkr_commission_max_trade_value_ratio: float = 0.01
+    slippage_atr_multiple: float = 0.0
+    spread_atr_multiple: float = 0.0
+    max_entry_atr_over_ema: float = 0.005
+    min_entry_bar_in_day: int = 5
 
     def __post_init__(self) -> None:
-        if len(self.action_low) != len(self.action_high):
-            raise ValueError("Environment action_low and action_high lengths must match")
-        if any(high <= low for low, high in zip(self.action_low, self.action_high, strict=True)):
-            raise ValueError("Each environment action_high entry must exceed the corresponding action_low entry")
+        if self.quote_size_shares <= 0.0:
+            raise ValueError("Environment quote_size_shares must be positive")
+        if self.ibkr_monthly_volume_shares < 0.0:
+            raise ValueError("Environment ibkr_monthly_volume_shares must be non-negative")
+        if self.ibkr_commission_min_per_order < 0.0:
+            raise ValueError("Environment ibkr_commission_min_per_order must be non-negative")
+        if not 0.0 <= self.ibkr_commission_max_trade_value_ratio <= 1.0:
+            raise ValueError(
+                "Environment ibkr_commission_max_trade_value_ratio must be between 0 and 1"
+            )
+        if self.slippage_atr_multiple < 0.0:
+            raise ValueError("Environment slippage_atr_multiple must be non-negative")
+        if self.spread_atr_multiple < 0.0:
+            raise ValueError("Environment spread_atr_multiple must be non-negative")
+        if self.max_entry_atr_over_ema < 0.0:
+            raise ValueError("Environment max_entry_atr_over_ema must be non-negative")
+        if self.min_entry_bar_in_day < 0:
+            raise ValueError("Environment min_entry_bar_in_day must be non-negative")
 
 
 @dataclass(frozen=True)
-class RewardConfig:
-    damped_pnl_eta: float = 0.25
-    inventory_penalty_eta: float = 0.01
-    reward_epsilon: float = 1e-8
-
-
-@dataclass(frozen=True)
-class PPOConfig:
-    actor_learning_rate: float = 1e-4
-    critic_learning_rate: float = 3e-5
-    min_learning_rate: float = 1e-6
-    discount: float = 0.99
-    gae_lambda: float = 0.95
-    clip_epsilon: float = 0.2
-    entropy_coefficient: float = 0.01
-    actor_l1: float = 0.
-    critic_l1: float = 0.
-    minibatch_size: int = 256
-    num_env: int = 256
-    num_update: int = 20
-    epochs: int = 10
+class SearchConfig:
+    k_init_atr_multiples: tuple[float, ...] = field(
+        default_factory=lambda: make_grid_axis_inclusive(0, 2, 0.1)
+    )
+    a_tp_atr_multiples: tuple[float, ...] = field(
+        default_factory=lambda: make_grid_axis_inclusive(0, 2, 0.1)
+    )
+    k_act_atr_multiples: tuple[float, ...] = field(
+        default_factory=lambda: make_grid_axis_inclusive(0., 0., 0.1)
+    )
+    entry_short_thresholds: tuple[float, ...] = field(
+        default_factory=lambda: make_grid_axis_inclusive(0.5, 1.2, 0.05)
+    )
+    entry_long_thresholds: tuple[float, ...] = field(
+        default_factory=lambda: make_grid_axis_inclusive(-1.2, -0.5, 0.05)
+    )
 
     def __post_init__(self) -> None:
-        if self.actor_learning_rate <= 0.0 or self.critic_learning_rate <= 0.0:
-            raise ValueError("PPO learning rates must be positive")
-        if self.min_learning_rate <= 0.0:
-            raise ValueError("PPO min_learning_rate must be positive")
-        if self.min_learning_rate > self.actor_learning_rate:
-            raise ValueError("PPO min_learning_rate cannot exceed actor_learning_rate")
-        if self.min_learning_rate > self.critic_learning_rate:
-            raise ValueError("PPO min_learning_rate cannot exceed critic_learning_rate")
-
-
-@dataclass(frozen=True)
-class ModelConfig:
-    hidden_sizes: tuple[int, ...] = (8, 8)
-    action_dim: int = 2
-
-    def __post_init__(self) -> None:
-        if self.action_dim <= 0:
-            raise ValueError("Model action_dim must be positive")
-
-
-@dataclass(frozen=True)
-class CheckpointConfig:
-    file_dir: Path = field(default_factory=lambda: Path("checkpoints") / "ppo_vol_scalping")
-    file_name: str = "latest_fold.pkl"
-
-    @property
-    def file_path(self) -> Path:
-        return self.file_dir / self.file_name
+        if not self.k_init_atr_multiples:
+            raise ValueError("Search k_init_atr_multiples cannot be empty")
+        if not self.a_tp_atr_multiples:
+            raise ValueError("Search a_tp_atr_multiples cannot be empty")
+        if not self.k_act_atr_multiples:
+            raise ValueError("Search k_act_atr_multiples cannot be empty")
+        if not self.entry_short_thresholds:
+            raise ValueError("Search entry_short_thresholds cannot be empty")
+        if not self.entry_long_thresholds:
+            raise ValueError("Search entry_long_thresholds cannot be empty")
+        if any(value < 0.0 for value in self.k_init_atr_multiples):
+            raise ValueError("Search k_init_atr_multiples must be non-negative")
+        if any(value < 0.0 for value in self.a_tp_atr_multiples):
+            raise ValueError("Search a_tp_atr_multiples must be non-negative")
+        if any(value < 0.0 for value in self.k_act_atr_multiples):
+            raise ValueError("Search k_act_atr_multiples must be non-negative")
+        if max(self.entry_long_thresholds) >= min(self.entry_short_thresholds):
+            raise ValueError("Search entry_long_thresholds must stay below entry_short_thresholds")
 
 
 @dataclass(frozen=True)
 class LoggingConfig:
     log_dir: Path = field(default_factory=lambda: Path("logs") / "ppo_vol_scalping")
-    json_path: str = "metrics.json"
-    print_every_epochs: int = 1
+    json_path: str = "grid_search_summary.json"
     evaluation_annualization_factor: int = 252 * 390
     emit_debug_print: bool = True
+
+    def __post_init__(self) -> None:
+        if self.evaluation_annualization_factor <= 0:
+            raise ValueError("Logging evaluation_annualization_factor must be positive")
 
 
 @dataclass(frozen=True)
@@ -110,15 +131,12 @@ class PPOVolScalpingConfig:
     data: DataConfig = field(default_factory=DataConfig)
     features: FeatureConfig = field(default_factory=FeatureConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
-    reward: RewardConfig = field(default_factory=RewardConfig)
-    ppo: PPOConfig = field(default_factory=PPOConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
-    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    search: SearchConfig = field(default_factory=SearchConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     def __post_init__(self) -> None:
-        if self.model.action_dim != len(self.environment.action_low):
-            raise ValueError("Model action_dim must match the number of environment action bounds")
+        if self.seed < 0:
+            raise ValueError("Config seed must be non-negative")
 
 
 def make_default_config() -> PPOVolScalpingConfig:
