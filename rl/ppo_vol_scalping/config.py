@@ -6,12 +6,12 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class DataConfig:
-    root: str = "MSFT"
+    root: str = "NVDA"
     start_date: int = 20200101
     end_date: int = 20251231
-    train_window_bars: int = 200_000
-    inference_window_bars: int = 100_000
-    fold_stride_bars: int = 100_000
+    train_window_bars: int = 80_000
+    inference_window_bars: int = 40_000
+    fold_stride_bars: int = 10_000
 
 
 @dataclass(frozen=True)
@@ -26,19 +26,28 @@ class FeatureConfig:
 
 @dataclass(frozen=True)
 class EnvironmentConfig:
-    episode_length: int = 32
-    episode_stride: int = 32
-    max_inventory: int = 500
+    episode_length: int = 128
+    episode_stride: int = 128
+    max_inventory: int = 1000
     flatten_at_session_end: bool = True
-    quote_size_shares: float = 100.0
-    action_low: tuple[float, ...] = (-2.0, 0.0)
-    action_high: tuple[float, ...] = (2.0, 4.0)
+    quote_size_shares: float = 1000.0
+    ibkr_monthly_volume_shares: float = 0.0
+    ibkr_commission_min_per_order: float = 0.35
+    ibkr_commission_max_trade_value_ratio: float = 0.01
+    action_low: tuple[float, ...] = (-3.0, 0.0)
+    action_high: tuple[float, ...] = (3.0, 6.0)
 
     def __post_init__(self) -> None:
         if len(self.action_low) != len(self.action_high):
             raise ValueError("Environment action_low and action_high lengths must match")
         if any(high <= low for low, high in zip(self.action_low, self.action_high, strict=True)):
             raise ValueError("Each environment action_high entry must exceed the corresponding action_low entry")
+        if self.ibkr_monthly_volume_shares < 0.0:
+            raise ValueError("Environment ibkr_monthly_volume_shares cannot be negative")
+        if self.ibkr_commission_min_per_order < 0.0:
+            raise ValueError("Environment ibkr_commission_min_per_order cannot be negative")
+        if self.ibkr_commission_max_trade_value_ratio < 0.0:
+            raise ValueError("Environment ibkr_commission_max_trade_value_ratio cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -50,18 +59,16 @@ class RewardConfig:
 
 @dataclass(frozen=True)
 class PPOConfig:
-    actor_learning_rate: float = 1e-4
-    critic_learning_rate: float = 3e-5
+    actor_learning_rate: float = 1e-5
+    critic_learning_rate: float = 1e-5
     min_learning_rate: float = 1e-6
     discount: float = 0.99
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
     entropy_coefficient: float = 0.01
-    actor_l1: float = 0.
-    critic_l1: float = 0.
-    minibatch_size: int = 256
-    num_env: int = 256
-    num_update: int = 20
+    minibatch_size: int = 128
+    num_env: int = 128
+    num_update: int = 100
     epochs: int = 10
 
     def __post_init__(self) -> None:

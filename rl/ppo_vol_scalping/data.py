@@ -102,7 +102,10 @@ def build_preprocessed_arrays(raw_bars_df: pd.DataFrame, feature_config: Feature
     directional_true_range_down = np.where(close_delta < 0.0, true_range, 0.0)
     atr_up = _ema(directional_true_range_up, feature_config.directional_atr_ema_length)
     atr_down = _ema(directional_true_range_down, feature_config.directional_atr_ema_length)
+    ema_directional_close = _ema(close, feature_config.directional_atr_ema_length)
     atr_imbalance = (atr_up - atr_down) / np.maximum(atr, feature_config.epsilon)
+    atr_up_over_close_milli = atr_up / np.maximum(ema_directional_close, feature_config.epsilon) * 1000.0
+    atr_down_over_close_milli = atr_down / np.maximum(ema_directional_close, feature_config.epsilon) * 1000.0
 
     signed_variance = variance_proxy * np.sign(log_return)
     srvi_num = _rolling_sum(signed_variance, feature_config.srvi_length)
@@ -121,8 +124,10 @@ def build_preprocessed_arrays(raw_bars_df: pd.DataFrame, feature_config: Feature
             # raw_bars_df["tau"].to_numpy(dtype=np.float64),
             # log_return,
             atr_over_close_milli,
+            atr_up_over_close_milli,
+            atr_down_over_close_milli,
             # srvi,
-            atr_imbalance,
+            # atr_imbalance,
             vslope,
             # vmacd,
             # vmacd_slope,

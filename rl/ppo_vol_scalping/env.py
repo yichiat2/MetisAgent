@@ -27,6 +27,9 @@ class EnvParam:
     max_inventory: float
     flatten_at_session_end: bool
     quote_size_shares: jnp.ndarray
+    ibkr_monthly_volume_shares: jnp.ndarray
+    ibkr_commission_min_per_order: jnp.ndarray
+    ibkr_commission_max_trade_value_ratio: jnp.ndarray
     action_low: jnp.ndarray
     action_high: jnp.ndarray
     ohlc: jnp.ndarray
@@ -44,6 +47,18 @@ def build_env_param(config: PPOVolScalpingConfig, train_arrays: PreprocessedArra
         max_inventory=float(config.environment.max_inventory),
         flatten_at_session_end=config.environment.flatten_at_session_end,
         quote_size_shares=jnp.asarray(config.environment.quote_size_shares, dtype=jnp.float32),
+        ibkr_monthly_volume_shares=jnp.asarray(
+            config.environment.ibkr_monthly_volume_shares,
+            dtype=jnp.float32,
+        ),
+        ibkr_commission_min_per_order=jnp.asarray(
+            config.environment.ibkr_commission_min_per_order,
+            dtype=jnp.float32,
+        ),
+        ibkr_commission_max_trade_value_ratio=jnp.asarray(
+            config.environment.ibkr_commission_max_trade_value_ratio,
+            dtype=jnp.float32,
+        ),
         action_low=jnp.asarray(config.environment.action_low, dtype=jnp.float32),
         action_high=jnp.asarray(config.environment.action_high, dtype=jnp.float32),
         ohlc=jnp.asarray(train_arrays.ohlc),
@@ -60,6 +75,38 @@ def _scale_action(action: jnp.ndarray, env_param: EnvParam) -> tuple[jnp.ndarray
     action_scale = env_param.action_high - env_param.action_low
     scaled_action = env_param.action_low + action_scale * normalized_action
     return normalized_action, scaled_action
+
+
+def _ibkr_pro_tiered_commission_rate(monthly_volume_shares: jnp.ndarray) -> jnp.ndarray:
+    conditions = (
+        monthly_volume_shares <= 300_000.0,
+        monthly_volume_shares <= 3_000_000.0,
+        monthly_volume_shares <= 20_000_000.0,
+        monthly_volume_shares <= 100_000_000.0,
+    )
+    rates = (
+        jnp.asarray(0.0035, dtype=jnp.float32),
+        jnp.asarray(0.0020, dtype=jnp.float32),
+        jnp.asarray(0.0015, dtype=jnp.float32),
+        jnp.asarray(0.0010, dtype=jnp.float32),
+    )
+    return jnp.select(conditions, rates, default=jnp.asarray(0.0005, dtype=jnp.float32))
+
+
+def _compute_ibkr_commission(
+    executed_shares: jnp.ndarray,
+    execution_price: jnp.ndarray,
+    env_param: EnvParam,
+) -> jnp.ndarray:
+    shares = jnp.abs(jnp.asarray(executed_shares, dtype=jnp.float32))
+    trade_value = shares * jnp.asarray(execution_price, dtype=jnp.float32)
+    per_share_rate = _ibkr_pro_tiered_commission_rate(env_param.ibkr_monthly_volume_shares)
+    raw_commission = shares * per_share_rate
+    capped_commission = jnp.minimum(
+        jnp.maximum(raw_commission, env_param.ibkr_commission_min_per_order),
+        env_param.ibkr_commission_max_trade_value_ratio * trade_value,
+    )
+    return jnp.where(shares > 0.0, capped_commission, jnp.asarray(0.0, dtype=jnp.float32))
 
 def build_observation(static_features: jnp.ndarray, inventory: float, max_inventory: float) -> jnp.ndarray:
     inventory_feature = inventory / max_inventory
@@ -176,12 +223,26 @@ def env_step(
     )
     bid_execution_price = jnp.minimum(bid_price, next_open)
     ask_execution_price = jnp.maximum(ask_price, next_open)
+    bid_executed_shares = bid_fill * bid_size
+    ask_executed_shares = ask_fill * ask_size
+    bid_commission = _compute_ibkr_commission(
+        bid_executed_shares,
+        bid_execution_price,
+        env_param,
+    )
+    ask_commission = _compute_ibkr_commission(
+        ask_executed_shares,
+        ask_execution_price,
+        env_param,
+    )
+    commission_cost = bid_commission + ask_commission
     inventory_after_trade = inventory_before + bid_fill * bid_size - ask_fill * ask_size
 
     cash_after_trade = (
         cash_before
         - bid_fill * bid_size * bid_execution_price
         + ask_fill * ask_size * ask_execution_price
+        - commission_cost
     )
     mark_close = jnp.where(valid_transition, next_close, current_close)
     equity_before = cash_before + inventory_before * current_close
@@ -204,14 +265,14 @@ def env_step(
     damped_log_ret = log_ret - damped_pnl_eta * jnp.maximum(0.0, -log_ret)
 
     # damped_log_ret = log_ret - damped_pnl_eta * jnp.square(jnp.minimum(0.0, log_ret))
-    damped_pnl = pnl - damped_pnl_eta * jnp.maximum(0.0, pnl)
+    damped_pnl = (pnl - damped_pnl_eta * jnp.maximum(0.0, pnl)) / env_param.max_inventory 
 
     flattened_cash = cash_after_trade + inventory_after_trade * current_close
     next_cash = jnp.where(should_flatten, flattened_cash, cash_after_trade)
     next_inventory = jnp.where(should_flatten, 0., inventory_after_trade)
     inventory_feature = next_inventory / env_param.max_inventory
     inventory_penalty = inventory_penalty_eta * jnp.square(inventory_feature)
-    reward = damped_log_ret # - inventory_penalty
+    reward = damped_pnl # - inventory_penalty
         
     next_state = EnvState(
         step_index=next_step_index,
@@ -248,6 +309,7 @@ def env_step(
         "cash_after": next_cash,
         "cash_after_trade": cash_after_trade,
         "cash_before": cash_before,
+        "commission_cost": commission_cost,
         "current_global_index": state.global_index,
         "current_step_index": state.step_index,
         "damped_pnl": damped_pnl,
@@ -269,6 +331,7 @@ def env_step(
         "return": step_return,
         "session_end": session_end,
         "spread": spread,
+        "transaction_cost": commission_cost,
         "valid_transition": valid_transition,
     }
     return next_observation, next_state, reward, done, info

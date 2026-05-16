@@ -18,7 +18,8 @@ _state: dict[str, Any] = {
 _server_started = False
 _server_lock = threading.Lock()
 ATR_OVER_CLOSE_MILLI_INDEX = STATIC_FEATURE_NAMES.index("atr_over_close_milli")
-ATR_IMBALANCE_INDEX = STATIC_FEATURE_NAMES.index("atr_imbalance")
+ATR_UP_OVER_CLOSE_MILLI_INDEX = STATIC_FEATURE_NAMES.index("atr_up_over_close_milli")
+ATR_DOWN_OVER_CLOSE_MILLI_INDEX = STATIC_FEATURE_NAMES.index("atr_down_over_close_milli")
 
 
 def prepare_inference_payload(
@@ -52,8 +53,10 @@ def prepare_inference_payload(
         )
     if aligned_static_features.shape[1] <= ATR_OVER_CLOSE_MILLI_INDEX:
         raise ValueError("Static features are missing atr_over_close_milli")
-    if aligned_static_features.shape[1] <= ATR_IMBALANCE_INDEX:
-        raise ValueError("Static features are missing atr_imbalance")
+    if aligned_static_features.shape[1] <= ATR_UP_OVER_CLOSE_MILLI_INDEX:
+        raise ValueError("Static features are missing atr_up_over_close_milli")
+    if aligned_static_features.shape[1] <= ATR_DOWN_OVER_CLOSE_MILLI_INDEX:
+        raise ValueError("Static features are missing atr_down_over_close_milli")
 
     actions = np.asarray(host_metrics["actions"], dtype=np.int32)
     if actions.shape[0] != num_steps:
@@ -62,7 +65,8 @@ def prepare_inference_payload(
     reservation_price = np.asarray(host_metrics["reservation_price"], dtype=np.float32)
     spread = np.asarray(host_metrics["spread"], dtype=np.float32)
     atr_over_ema = aligned_static_features[:num_steps, ATR_OVER_CLOSE_MILLI_INDEX] / 1000.0
-    atr_imbalance = aligned_static_features[:num_steps, ATR_IMBALANCE_INDEX]
+    atr_up_over_ema = aligned_static_features[:num_steps, ATR_UP_OVER_CLOSE_MILLI_INDEX] / 1000.0
+    atr_down_over_ema = aligned_static_features[:num_steps, ATR_DOWN_OVER_CLOSE_MILLI_INDEX] / 1000.0
 
     return {
         "fold_id": int(fold_id),
@@ -79,8 +83,9 @@ def prepare_inference_payload(
         "ohlc": aligned_ohlc[1:, :4],
         "reservation_price": reservation_price,
         "spread": spread,
-        "atr_imbalance": atr_imbalance,
         "atr_over_ema": atr_over_ema,
+        "atr_up_over_ema": atr_up_over_ema,
+        "atr_down_over_ema": atr_down_over_ema,
         "bid_price": bid_price,
         "ask_price": ask_price,
         "inventory": np.asarray(host_metrics["inventory"], dtype=np.float32),
@@ -165,14 +170,17 @@ def build_inference_figure(payload: Mapping[str, Any]):
     inventory = np.asarray(payload["inventory"], dtype=np.float32)
     pnl = np.asarray(payload["pnl"], dtype=np.float32)
     cumulative_pnl = np.asarray(payload["cumulative_pnl"], dtype=np.float32)
-    atr_imbalance = np.asarray(payload["atr_imbalance"], dtype=np.float32)
     atr_over_ema = np.asarray(payload["atr_over_ema"], dtype=np.float32)
+    atr_up_over_ema = np.asarray(payload["atr_up_over_ema"], dtype=np.float32)
+    atr_down_over_ema = np.asarray(payload["atr_down_over_ema"], dtype=np.float32)
     actions = np.asarray(payload["actions"], dtype=np.float32)
     timestep = np.arange(ohlc.shape[0], dtype=np.int32)
-    if atr_imbalance.shape[0] != timestep.shape[0]:
-        raise ValueError("Expected ATR imbalance series to align with the inference horizon")
     if atr_over_ema.shape[0] != timestep.shape[0]:
         raise ValueError("Expected ATR / EMA series to align with the inference horizon")
+    if atr_up_over_ema.shape[0] != timestep.shape[0]:
+        raise ValueError("Expected ATR up / EMA series to align with the inference horizon")
+    if atr_down_over_ema.shape[0] != timestep.shape[0]:
+        raise ValueError("Expected ATR down / EMA series to align with the inference horizon")
 
     fig = make_subplots(
         rows=4,
@@ -188,7 +196,7 @@ def build_inference_figure(payload: Mapping[str, Any]):
         ],
         subplot_titles=(
             "OHLC (t + 1) with reservation price and bid/ask quotes (t)",
-            "Cumulative PnL, step PnL, and ATR imbalance",
+            "Cumulative PnL, step PnL, and directional ATR / EMA(close)",
             "ATR / EMA(close) at t",
             "A1 inventory skew and A2 spread multiplier",
         ),
@@ -285,10 +293,22 @@ def build_inference_figure(payload: Mapping[str, Any]):
     fig.add_trace(
         go.Scatter(
             x=timestep,
-            y=atr_imbalance,
+            y=atr_up_over_ema,
             mode="lines",
-            name="ATR imbalance t",
-            line={"color": "#7c3aed", "width": 1.4},
+            name="ATR up / EMA(close) t",
+            line={"color": "#0f766e", "width": 1.4},
+        ),
+        row=2,
+        col=1,
+        secondary_y=True,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=timestep,
+            y=atr_down_over_ema,
+            mode="lines",
+            name="ATR down / EMA(close) t",
+            line={"color": "#b91c1c", "width": 1.4},
         ),
         row=2,
         col=1,
@@ -329,7 +349,7 @@ def build_inference_figure(payload: Mapping[str, Any]):
     fig.update_yaxes(title_text="Price", row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="Inventory", row=1, col=1, secondary_y=True)
     fig.update_yaxes(title_text="Cumulative PnL", row=2, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="Step PnL / ATR imbalance", row=2, col=1, secondary_y=True)
+    fig.update_yaxes(title_text="Step PnL / directional ATR", row=2, col=1, secondary_y=True)
     fig.update_yaxes(title_text="ATR / EMA(close)", row=3, col=1)
     fig.update_yaxes(title_text="A1 inventory skew", row=4, col=1, secondary_y=False)
     fig.update_yaxes(title_text="A2 spread multiplier", row=4, col=1, secondary_y=True)
